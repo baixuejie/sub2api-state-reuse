@@ -1,7 +1,8 @@
 [Unit]
-Description=Check Sub2API STATE tickets every minute
+Description=Check Sub2API STATE tickets every 20 seconds
 [Timer]
-OnCalendar=*-*-* *:*:00
+OnCalendar=*-*-* *:*:00/20
+AccuracySec=1s
 Persistent=true
 Unit=state-collector.service
 [Install]

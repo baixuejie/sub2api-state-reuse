@@ -288,11 +288,10 @@ def run_locked():
                     "expires_at": newest["issued"] + 3570 if newest else None,
                 }
             )
-            if (
-                status in ("renew_due", "missing")
-                and now - state["attempts"].get(k, 0) >= 300
-            ):
-                jobs.append((a["id"], model))
+            if status in ("renew_due", "missing") and now - state["attempts"].get(
+                k, 0
+            ) >= local_ip_harvest.retry_interval(status):
+                jobs.append((a["id"], model, local_ip_harvest.retry_interval(status)))
                 state["attempts"][k] = now
     atomic(STATE, state)
     results = []
@@ -301,10 +300,12 @@ def run_locked():
     deadline = time.monotonic() + 150
 
     def worker(item):
-        id, model = item
+        id, model, interval = item
         a = next(a for a in accounts if a["id"] == id)
-        result = local_ip_harvest.collect(a, routes, harvest_state, STORE, deadline)
-        # Persist cooldowns before any production verification request.
+        result = local_ip_harvest.collect(
+            a, routes, harvest_state, STORE, deadline, interval=interval
+        )
+        # The cycle lock protects collection; all worker cooldowns are saved after the batch.
         ok = False
         if result.get("captured"):
             try:
@@ -360,7 +361,8 @@ def run_locked():
         a = a_by_id[row["account_id"]]
         st = state.get("local_ip_harvest", {}).get(str(a["id"]) + ":" + a["hash"], {})
         row["next_attempt"] = max(
-            state["attempts"].get(str(a["id"]) + ":" + MODEL, 0) + 300,
+            state["attempts"].get(str(a["id"]) + ":" + MODEL, 0)
+            + local_ip_harvest.retry_interval(row["status"]),
             st.get("next_attempt", 0),
         )
         row["auth_block"] = bool(st.get("auth_block", False))

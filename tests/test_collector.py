@@ -84,7 +84,7 @@ class CollectorTests(unittest.TestCase):
             queue.assert_called_once()
             self.assertEqual(state["101:" + "a" * 64]["preferred"], "0")
 
-    def test_rotates_at_most_three(self):
+    def test_rotates_one_route_per_cycle(self):
         state = {}
         with patch.object(
             harvest,
@@ -94,8 +94,48 @@ class CollectorTests(unittest.TestCase):
             harvest.collect(
                 self.account, self.routes, state, None, time.monotonic() + 150
             )
-            self.assertEqual(request.call_count, 3)
-            self.assertEqual(state["101:" + "a" * 64]["cursor"], 3)
+            self.assertEqual(request.call_count, 1)
+            self.assertEqual(state["101:" + "a" * 64]["cursor"], 1)
+
+    def test_missing_and_renewal_intervals(self):
+        self.assertEqual(harvest.retry_interval("missing"), 20)
+        self.assertEqual(harvest.retry_interval("renew_due"), 300)
+
+    def test_failed_preferred_route_rotates_after_twenty_seconds(self):
+        state = {"101:" + "a" * 64: {"preferred": "0"}}
+        response = ({"completed": True, "actual_model": "other-model"}, "")
+        with patch.object(
+            harvest, "request", return_value=response
+        ) as request, patch.object(harvest.time, "time", return_value=1000):
+            harvest.collect(
+                self.account, self.routes, state, None, time.monotonic() + 150
+            )
+            st = state["101:" + "a" * 64]
+            self.assertEqual(st["next_attempt"], 1020)
+            self.assertNotIn("preferred", st)
+            self.assertEqual(request.call_args.args[1]["key"], "0")
+        with patch.object(
+            harvest, "request", return_value=response
+        ) as request, patch.object(harvest.time, "time", return_value=1019):
+            harvest.collect(
+                self.account, self.routes, state, None, time.monotonic() + 150
+            )
+            request.assert_not_called()
+        with patch.object(
+            harvest, "request", return_value=response
+        ) as request, patch.object(harvest.time, "time", return_value=1020):
+            harvest.collect(
+                self.account, self.routes, state, None, time.monotonic() + 150
+            )
+            self.assertEqual(request.call_args.args[1]["key"], "1")
+
+    def test_long_cooldown_survives_fast_schedule(self):
+        state = {"101:" + "a" * 64: {"next_attempt": time.time() + 7200}}
+        with patch.object(harvest, "request") as request:
+            harvest.collect(
+                self.account, self.routes, state, None, time.monotonic() + 150
+            )
+            request.assert_not_called()
 
     def test_shapes_age_and_owner_handoff(self):
         for size in (217, 249, 233, 265):

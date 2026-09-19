@@ -251,10 +251,17 @@ def order_routes(routes, st):
     preferred = next((r for r in routes if r["key"] == st.get("preferred")), None)
     if preferred:
         ordered = [preferred] + [r for r in ordered if r != preferred]
-    return ordered[:3]
+    # Never pin a failed account to the same preferred route.
+    if len(routes) > 1:
+        ordered = [r for r in ordered if r["key"] != st.get("last_route")]
+    return ordered[:1]
 
 
-def collect(a, routes, state, store, deadline):
+def retry_interval(status):
+    return 20 if status == "missing" else 300
+
+
+def collect(a, routes, state, store, deadline, interval=20):
     st = state.setdefault(str(a["id"]) + ":" + a["hash"], {})
     out = {
         "account_id": a["id"],
@@ -275,11 +282,15 @@ def collect(a, routes, state, store, deadline):
     if time.monotonic() > deadline:
         out["budget_exhausted"] = True
         return out
-    st["next_attempt"] = time.time() + 300
+    st["next_attempt"] = time.time() + interval
     for route in order_routes(routes, st):
         if time.monotonic() + 65 > deadline:
             break
         st["cursor"] = (routes.index(route) + 1) % len(routes)
+        st["last_route"] = route["key"]
+        # Restore preference only after a new capture and carry-ticket verification.
+        if st.get("preferred") == route["key"]:
+            st.pop("preferred", None)
         emit(a["id"], "attempt_started", source=route["name"], phase="capture")
         try:
             r, value = request(a, route)

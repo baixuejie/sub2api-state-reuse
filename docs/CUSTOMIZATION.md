@@ -63,11 +63,11 @@ sudo systemctl enable --now state-proxy.socket
 | 接受292/332、时间戳与过期 | `collector/ticket_store.py::candidate`、`state-cron.py::valid`、`plugin/main.go::parseState/validTicket` |
 | 实际模型与完整流 | `collector/local_ip_harvest.py::request/collect`、`plugin/main.go::harvest` |
 | 携票第二次请求 | `local_ip_harvest.py::collect` |
-| 每轮3出口、成功出口优先 | `order_routes` |
-| 单账号5分钟间隔 | `state-cron.py` 的 `300` 秒检查与 `collect` 的 `next_attempt` |
+| 每轮1出口、失败后轮换 | `order_routes` |
+| 缺票20秒、有效票续采300秒间隔 | `local_ip_harvest.py::retry_interval` 与 `collect` 的 `next_attempt` |
 | 全局3并发、150秒采集预算 | `state-cron.py` 的 ThreadPoolExecutor/deadline |
 | 50分钟开始续票、3570秒视为过期 | Python valid/调度与Go validTicket/ticket；改动需同步 |
-| 每分钟调度、270秒进程上限 | `deploy/state-collector.timer/service` |
+| 每20秒调度、270秒进程上限 | `deploy/state-collector.timer/service` |
 | 账号组切换 | `state-cron.py::sync_groups` |
 
 如果增加一个模型，不能只改 `settings.MODEL`：Go插件对Astra的自动采集分支、前端实际模型校验、SQL中的model mapping、票据key隔离、测试和页面文字都要同步。**模型名和票据长度是两种不同维度**，不要为了让UI变绿而只修改显示判断。

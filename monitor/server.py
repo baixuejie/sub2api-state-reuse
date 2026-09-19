@@ -88,9 +88,10 @@ def snapshot():
         "tickets": tickets,
         "events": tail_events(),
         "policy": {
-            "check_seconds": 60,
-            "account_interval": 300,
-            "routes_per_cycle": 3,
+            "check_seconds": 20,
+            "account_interval": 20,
+            "renew_interval": 300,
+            "routes_per_cycle": 1,
             "concurrency": 3,
         },
     }
