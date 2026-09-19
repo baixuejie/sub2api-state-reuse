@@ -1,0 +1,16 @@
+Sub2API STATE Reuse
+
+This repository contains an independently maintained STATE reuse plugin,
+collector and administrator monitor, extracted from an operational integration.
+It is not an official OpenAI product or an official Sub2API release.
+
+The vendored plugin/pkg/pluginapi directory comes from the Sub2API plugin SDK
+in rw0104/sub2api-cost-console (commit 9b8ee29d0f2b1291be27449f84e14868b9d34c0c),
+which derives from Wei-Shaw/sub2api. Upstream license: GNU LGPL version 3.
+The original Go module/import namespace is preserved to keep the SDK snapshot
+self-contained. The Sub2API host application is not bundled.
+
+See LICENSE (LGPL-3.0) and COPYING (GPL-3.0 terms incorporated by LGPL-3.0).
+Local modifications include 292/332 ticket validation, credential-isolated
+candidate persistence, runtime/manifest version checks, configurable deployment
+settings, collection events and the same-origin administrator monitor.

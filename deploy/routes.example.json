@@ -1,0 +1,4 @@
+[
+  { "name": "Clash-node-A", "port": 18300 },
+  { "name": "Clash-node-B", "port": 18301 }
+]

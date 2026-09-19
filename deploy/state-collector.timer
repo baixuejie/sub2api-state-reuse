@@ -1,0 +1,8 @@
+[Unit]
+Description=Check Sub2API STATE tickets every minute
+[Timer]
+OnCalendar=*-*-* *:*:00
+Persistent=true
+Unit=state-collector.service
+[Install]
+WantedBy=timers.target

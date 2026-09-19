@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>STATE 采集日志 · Sub2API</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b1020;
+        --card: #131c30;
+        --line: #293650;
+        --muted: #a9b9d0;
+        --text: #eef4ff;
+        --green: #6ce5b6;
+        --blue: #80b9ff;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          14px/1.6 system-ui,
+          -apple-system,
+          sans-serif;
+      }
+      main {
+        max-width: 1240px;
+        margin: auto;
+        padding: 32px 24px;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 16px;
+      }
+      h1 {
+        font-size: 29px;
+        margin: 3px 0;
+      }
+      h2 {
+        font-size: 17px;
+        margin: 0;
+      }
+      .eyebrow {
+        color: var(--blue);
+        letter-spacing: 2px;
+        font-size: 12px;
+      }
+      p {
+        color: var(--muted);
+        margin: 4px 0 16px;
+      }
+      a {
+        color: var(--blue);
+      }
+      header > a {
+        white-space: nowrap;
+      }
+      button,
+      select,
+      input {
+        background: #1b2943;
+        border: 1px solid #40516d;
+        border-radius: 8px;
+        color: var(--text);
+        padding: 9px 12px;
+        font: inherit;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:hover {
+        background: #293b59;
+      }
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 14px;
+        margin: 24px 0;
+      }
+      .metric,
+      .panel {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+      }
+      .metric {
+        padding: 18px;
+      }
+      .metric span {
+        display: block;
+        color: var(--muted);
+      }
+      .metric strong {
+        display: block;
+        font-size: 28px;
+        margin-top: 4px;
+      }
+      .panel {
+        margin-top: 18px;
+        overflow: hidden;
+      }
+      .bar {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+        flex-wrap: wrap;
+        padding: 18px 20px;
+        border-bottom: 1px solid var(--line);
+      }
+      .controls {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .scroll {
+        overflow: auto;
+        max-height: 560px;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        text-align: left;
+        white-space: nowrap;
+      }
+      th {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 500;
+        background: #18233a;
+        position: sticky;
+        top: 0;
+      }
+      td,
+      th {
+        padding: 12px 18px;
+        border-bottom: 1px solid var(--line);
+      }
+      tbody tr:last-child td {
+        border: 0;
+      }
+      .badge {
+        font-size: 12px;
+        border-radius: 5px;
+        padding: 4px 7px;
+        background: #203449;
+        color: var(--blue);
+      }
+      .good {
+        color: var(--green);
+        background: #143b35;
+      }
+      .warn {
+        color: #ffd28a;
+        background: #453521;
+      }
+      .bad {
+        color: #ffafb7;
+        background: #482a38;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      #notice {
+        padding: 12px 16px;
+        margin-top: 16px;
+        border: 1px solid #40516d;
+        border-radius: 8px;
+      }
+      #notice:empty {
+        display: none;
+      }
+      .live {
+        color: var(--green);
+      }
+      .footer {
+        margin-top: 20px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .empty {
+        padding: 30px;
+        text-align: center;
+        color: var(--muted);
+      }
+      @media (max-width: 700px) {
+        main {
+          padding: 20px 12px;
+        }
+        .metrics {
+          grid-template-columns: repeat(2, 1fr);
+        }
+        header {
+          align-items: flex-start;
+        }
+        h1 {
+          font-size: 23px;
+        }
+        .bar {
+          padding: 14px;
+        }
+        td,
+        th {
+          padding: 10px 12px;
+        }
+      }
+    </style>
+    <script src="/fn-state/app.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <div class="eyebrow">SUB2API / STATE</div>
+          <h1>采集实时日志</h1>
+          <p>本地 Clash + IP 管理 · 292 / 332 · Astra 完整响应与携票复验</p>
+        </div>
+        <a href="/admin/accounts">返回账号管理 ↗</a>
+      </header>
+      <div id="notice" role="status"></div>
+      <section class="metrics" aria-label="采集概要">
+        <div class="metric">
+          <span>有效票据账号</span><strong id="ready">—</strong>
+        </div>
+        <div class="metric">
+          <span>等待采集</span><strong id="missing">—</strong>
+        </div>
+        <div class="metric">
+          <span>暂停账号</span><strong id="paused">—</strong>
+        </div>
+        <div class="metric">
+          <span>最近采集检查</span
+          ><strong id="checked" style="font-size: 20px">—</strong>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="bar">
+          <h2>账号状态</h2>
+          <span class="muted" id="policy"
+            >每分钟检查 · 单账号间隔 5 分钟 · 每轮最多 3 个出口</span
+          >
+        </div>
+        <div
+          class="scroll"
+          tabindex="0"
+          role="region"
+          aria-label="可滚动数据表"
+        >
+          <table>
+            <thead>
+              <tr>
+                <th>账号</th>
+                <th>状态</th>
+                <th>票据长度</th>
+                <th>到期时间</th>
+                <th>下次尝试 / 续票</th>
+              </tr>
+            </thead>
+            <tbody id="accounts"></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="bar">
+          <h2>实时事件 <span id="live" class="live">● 每 3 秒刷新</span></h2>
+          <div class="controls">
+            <label
+              >账号
+              <select id="account-filter">
+                <option value="">全部</option>
+              </select></label
+            ><label
+              >结果
+              <select id="result-filter">
+                <option value="">全部</option>
+                <option value="success">成功</option>
+                <option value="failure">失败 / 未达标</option>
+              </select></label
+            ><button id="toggle">暂停刷新</button
+            ><button id="refresh">立即刷新</button>
+          </div>
+        </div>
+        <div
+          class="scroll"
+          tabindex="0"
+          role="region"
+          aria-label="可滚动数据表"
+        >
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>账号</th>
+                <th>阶段</th>
+                <th>出口</th>
+                <th>结果</th>
+                <th>票据 / 实际模型</th>
+              </tr>
+            </thead>
+            <tbody id="events"></tbody>
+          </table>
+        </div>
+      </section>
+      <p class="footer" id="updated">正在连接…</p>
+      <p class="footer">
+        只展示最近 500 条脱敏事件。候选通过携票复验后才入库；HTTP 200
+        本身不代表采集成功。Clash 出口依赖本地 Mac 在线。
+      </p>
+    </main>
+  </body>
+</html>

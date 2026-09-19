@@ -1,0 +1,6 @@
+{
+  "proxy_url": "http://host.docker.internal:17892",
+  "harvest_proxy_api": "",
+  "accounts": [101, 102],
+  "suspended": []
+}

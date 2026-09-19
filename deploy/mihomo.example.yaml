@@ -1,0 +1,21 @@
+# Merge your own proxy definitions here. Keep the completed file private.
+mode: rule
+log-level: error
+ipv6: false
+allow-lan: false
+dns:
+  enable: false
+proxies: []
+listeners:
+  - name: state-node-a
+    type: mixed
+    listen: 127.0.0.1
+    port: 18300
+    proxy: YOUR_NODE_A
+  - name: state-node-b
+    type: mixed
+    listen: 127.0.0.1
+    port: 18301
+    proxy: YOUR_NODE_B
+rules:
+  - MATCH,DIRECT
