@@ -154,6 +154,129 @@ func TestForwardInjectsWithoutChangingBody(t *testing.T) {
 		t.Fatal("invalid response frame sequence")
 	}
 }
+
+func protectedStream(ctx context.Context, accountID int64, h http.Header) *stream {
+	hs := map[string]*v1.HeaderValues{}
+	for k, values := range h {
+		hs[k] = &v1.HeaderValues{Values: values}
+	}
+	body := []byte(`{"model":"gpt-6-astra","input":"test","stream":true}`)
+	return &stream{ctx: ctx, in: []*v1.ForwardRequest{
+		{Frame: &v1.ForwardRequest_Start{Start: &v1.ForwardRequestStart{AccountId: accountID, Method: "POST", Url: "https://chatgpt.com/backend-api/codex/responses", Headers: hs}}},
+		{Frame: &v1.ForwardRequest_BodyChunk{BodyChunk: body}},
+		{Frame: &v1.ForwardRequest_BodyEnd{BodyEnd: true}},
+	}}
+}
+
+func TestBusiness429RetainsCurrentTicket(t *testing.T) {
+	h := headers()
+	p := NewPlugin(filepath.Join(t.TempDir(), "tickets.json"))
+	ticket := makeTicket(17, "gpt-6-astra", identity(h), time.Now().Unix())
+	entry := &Entry{ticket: ticket}
+	var calls atomic.Int32
+	p.config.Accounts = []int64{17}
+	p.entries[key(17, ticket.Model, ticket.CredentialHash)] = entry
+	p.businessClientFactory = func(string) (*http.Client, error) {
+		return &http.Client{Transport: roundtrip(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return &http.Response{StatusCode: 429, Status: "429 Too Many Requests", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(nil))}, nil
+		})}, nil
+	}
+	if err := p.Forward(protectedStream(context.Background(), 17, h)); err != nil {
+		t.Fatal(err)
+	}
+	second := protectedStream(context.Background(), 17, h)
+	if err := p.Forward(second); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 || second.out[0].GetStart().StatusCode != 429 {
+		t.Fatal("business backoff forwarded another request")
+	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.ticket.Value != ticket.Value {
+		t.Fatal("429 discarded a valid ticket")
+	}
+	if !entry.cooldown.After(time.Now()) {
+		t.Fatal("429 did not start harvest cooldown")
+	}
+}
+
+func TestStaleAuthResponseCannotDeleteNewTicket(t *testing.T) {
+	h := headers()
+	p := NewPlugin(filepath.Join(t.TempDir(), "tickets.json"))
+	old := makeTicket(17, "gpt-6-astra", identity(h), time.Now().Unix())
+	newer := makeTicket(17, "gpt-6-astra", identity(h), old.Issued+1)
+	entry := &Entry{ticket: old}
+	p.config.Accounts = []int64{17}
+	p.entries[key(17, old.Model, old.CredentialHash)] = entry
+	p.businessClientFactory = func(string) (*http.Client, error) {
+		return &http.Client{Transport: roundtrip(func(*http.Request) (*http.Response, error) {
+			entry.mu.Lock()
+			entry.ticket = newer
+			entry.mu.Unlock()
+			return &http.Response{StatusCode: 401, Status: "401 Unauthorized", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(nil))}, nil
+		})}, nil
+	}
+	if err := p.Forward(protectedStream(context.Background(), 17, h)); err != nil {
+		t.Fatal(err)
+	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.ticket.Value != newer.Value || entry.blocked {
+		t.Fatal("stale response invalidated a newer ticket")
+	}
+}
+
+func TestBusinessConcurrencyLimitedPerAccount(t *testing.T) {
+	h := headers()
+	p := NewPlugin(filepath.Join(t.TempDir(), "tickets.json"))
+	ticket := makeTicket(17, "gpt-6-astra", identity(h), time.Now().Unix())
+	p.config.Accounts = []int64{17}
+	p.entries[key(17, ticket.Model, ticket.CredentialHash)] = &Entry{ticket: ticket}
+	entered := make(chan struct{}, 4)
+	release := make(chan struct{}, 4)
+	var active atomic.Int32
+	var maximum atomic.Int32
+	p.businessClientFactory = func(string) (*http.Client, error) {
+		return &http.Client{Transport: roundtrip(func(*http.Request) (*http.Response, error) {
+			n := active.Add(1)
+			for old := maximum.Load(); n > old && !maximum.CompareAndSwap(old, n); old = maximum.Load() {
+			}
+			entered <- struct{}{}
+			<-release
+			active.Add(-1)
+			return &http.Response{StatusCode: 200, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(nil))}, nil
+		})}, nil
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := p.Forward(protectedStream(context.Background(), 17, h)); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	<-entered
+	<-entered
+	select {
+	case <-entered:
+		t.Fatal("more than two business requests entered concurrently")
+	case <-time.After(100 * time.Millisecond):
+	}
+	release <- struct{}{}
+	release <- struct{}{}
+	<-entered
+	<-entered
+	release <- struct{}{}
+	release <- struct{}{}
+	wg.Wait()
+	if maximum.Load() != businessConcurrencyPerAccount {
+		t.Fatalf("maximum concurrency=%d", maximum.Load())
+	}
+}
 func TestForwardLongConversationsConcurrently(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
@@ -297,4 +420,23 @@ func TestVerified292CandidateImport(t *testing.T) {
 	if len(stored) != 1 || stored[0].Value != v.Value {
 		t.Fatal("not persisted")
 	}
+}
+
+func TestAccountSlotsIsolationAndCancellation(t *testing.T) {
+	p := NewPlugin(filepath.Join(t.TempDir(), "tickets.json"))
+	r1, _ := p.acquireBusiness(context.Background(), 17)
+	defer r1()
+	r2, _ := p.acquireBusiness(context.Background(), 17)
+	defer r2()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if release, err := p.acquireBusiness(ctx, 17); err == nil {
+		release()
+		t.Fatal("canceled waiter acquired full slot")
+	}
+	other, err := p.acquireBusiness(context.Background(), 18)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other()
 }

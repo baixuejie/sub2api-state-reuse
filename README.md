@@ -2,7 +2,7 @@
 
 给支持插件 v2 的 Sub2API 号池增加 **STATE 292/332 票据复用、本地 Clash + IP 管理多出口采集、自动分组和管理员实时日志**。
 
-这是独立插件与运维组件，不是整个 Sub2API 主站源码。公开版本 `1.0.12` 从已部署的 `1.0.11` 整理而来：移除生产固定地址，集中配置，并补齐测试和部署模板。安装本项目不会自动修改你的主站数据库结构。
+这是独立插件与运维组件，不是整个 Sub2API 主站源码。公开版本 `1.0.13` 从已部署的 `1.0.11` 整理而来：移除生产固定地址，集中配置，并补齐测试和部署模板。安装本项目不会自动修改你的主站数据库结构。
 
 > 292/332 是本项目采用的经验性票据形态，不是官方能力保证。采集器还要求实际响应模型为 `gpt-6-astra`、完整 `response.completed`，并携票再次验证；HTTP 200 或票据长度本身不能证明成功。本项目不提供账号、OAuth、代理订阅或现成票据。
 
@@ -10,6 +10,7 @@
 
 - 本地 Mihomo/Clash 独立监听多个节点，通过 SSH 反向通道供服务器采集。
 - 同时读取号池「IP 管理」中启用、未过期的 HTTP / SOCKS5 代理；成功出口优先，其余轮换。
+- 同一账号业务并发上限为 2，覆盖整个流式响应；排队服从请求取消和宿主超时。429 保留票据，业务至少退避 5 分钟（尊重更长 Retry-After）；401/403 仅撤销请求实际使用的当前票据，旧响应不能误删新票。退避目前保存在单个插件进程内，重启不持久化，宿主账号限流仍须保留。
 - 默认每 20 秒检查；缺票/过期账号至少间隔 20 秒，每轮只试 1 个出口，失败后轮换；有效票临近到期时仍每 5 分钟续采，全局并发 3。
 - 292/332 候选经完整 Astra 响应和携票复验后交给插件，按账号、模型、当前 OAuth 凭据隔离存储。
 - 有有效 Astra 票据的账号进入“不降智分组”，没有则进入“降智分组”；保留其他分组。
@@ -73,6 +74,7 @@ sudo install -m 600 deploy/routes.example.json /etc/sub2api-state-reuse/routes.j
 | 配置 | 必须核对什么 |
 |---|---|
 | `STATE_ROOT` | 采集状态、锁和脱敏日志目录；不放进 Git |
+| `STATE_DYNAMIC_PROXY_GENERATORS_FILE` | 动态 HTTP 代理生成器的私有 JSON 配置文件 |
 | `STATE_TICKET_STORE` | 宿主机上的 `tickets.json` 路径，与容器 `/app/data/fn-state-reuse/tickets.json` 指向同一份 bind mount |
 | `SUB2API_BASE_URL` | 号池管理 API，不要误填中转主站；包含 `/api/v1` |
 | `SUB2API_ENV_FILE` | 独立管理员凭据文件，内容为 `ADMIN_EMAIL` / `ADMIN_PASSWORD`，0600 |
@@ -82,6 +84,16 @@ sudo install -m 600 deploy/routes.example.json /etc/sub2api-state-reuse/routes.j
 | `STATE_ROUTES_FILE` | Clash 路由名与服务器 loopback 端口列表；不放代理密码 |
 | `STATE_PLUGIN_UID` / `STATE_PLUGIN_GID` | 容器内运行插件的 UID/GID，用于写入候选文件；不要盲用 1000 |
 | `STATE_MONITOR_PORT` | 默认仅监听 `127.0.0.1:17843`；改端口时同步 nginx |
+
+可选的动态 HTTP 代理生成器文件使用以下格式，并应设为 `0600`。`url` 必须返回一行 `IP:PORT`；采集器每次最多读取 4 KiB，只接受合法 IP 和端口。接口失败时会跳过并继续使用 Clash/IP 管理出口。真实生成器 URL 通常包含鉴权信息，不要提交到 Git：
+
+```json
+[
+  {"name": "rotating-provider", "url": "https://provider.example/generate"}
+]
+```
+
+缺票时动态出口与静态出口交替尝试；每次选中动态出口都会重新调用生成器，因此连续两次动态尝试可能得到不同 IP。
 
 确认 Docker 挂载和 UID/GID，例如：
 
@@ -127,7 +139,7 @@ make check test
 make build
 ```
 
-产物：`plugin/state-reuse-1.0.12.s2plugin`。第一次打包会生成你自己的 `plugin/publisher.key`，后续升级必须保存并复用它。私钥已被 `.gitignore` 排除；CI 每次生成的临时密钥不应当作正式发布身份。
+产物：`plugin/state-reuse-1.0.13.s2plugin`。第一次打包会生成你自己的 `plugin/publisher.key`，后续升级必须保存并复用它。私钥已被 `.gitignore` 排除；CI 每次生成的临时密钥不应当作正式发布身份。
 
 在号池管理员后台：
 
@@ -135,7 +147,7 @@ make build
 2. 查看插件 ID，并更新 `STATE_PLUGIN_ID`。
 3. 参考 [plugin-config.example.json](deploy/plugin-config.example.json) 填插件配置：`proxy_url` 为**容器可达**的采集代理；`accounts` 填自己要保护的账号 ID，不能直接照抄示例；`harvest_proxy_api` 留空即可。
 4. 为 `openai.oauth.protection_transport.v1` 设置**明确且非空的账号范围**。该宿主的空路由账号范围可能代表全部账号。
-5. 启用插件并确认 runtime healthy、版本为 `1.0.12`。没有经过宿主认证的版本可能需要后台确认“接受未测试版本”。
+5. 启用插件并确认 runtime healthy、版本为 `1.0.13`。没有经过宿主认证的版本可能需要后台确认“接受未测试版本”。
 
 在两个目标分组中加入你要自动维护的 OAuth 账号。采集器会同步两个分组成员的插件保护范围并保留以前已保护的账号；停用整个采集器不会清除原路由范围。需要移除账号时，应同时检查分组、插件配置及路由绑定。
 

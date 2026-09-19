@@ -190,9 +190,75 @@ class CollectorTests(unittest.TestCase):
 
         with patch.object(
             settings, "ROUTES_FILE", Path(self.temp.name) / "missing.json"
+        ), patch.object(
+            settings,
+            "DYNAMIC_PROXY_GENERATORS_FILE",
+            Path(self.temp.name) / "missing-generators.json",
         ):
             routes = harvest.routes_for(Fake)
         self.assertEqual(routes[0]["url"], "socks5h://u%40x:p%3Ax@192.0.2.1:1080")
+
+    def test_dynamic_generator_accepts_only_ip_and_port(self):
+        config = Path(self.temp.name) / "generators.json"
+        config.write_text(json.dumps([{"name": "rotating", "url": "https://example"}]))
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            @staticmethod
+            def read(_):
+                return b"192.0.2.10:8080\n"
+
+        with patch.object(
+            settings, "DYNAMIC_PROXY_GENERATORS_FILE", config
+        ), patch.object(harvest.urllib.request, "urlopen", return_value=Response()):
+            routes = harvest.dynamic_routes()
+        self.assertEqual(
+            routes,
+            [
+                {
+                    "key": "generator:rotating",
+                    "name": "动态IP/rotating",
+                    "url": "http://192.0.2.10:8080",
+                }
+            ],
+        )
+
+    def test_dynamic_generator_rejects_non_ip_response(self):
+        config = Path(self.temp.name) / "generators.json"
+        config.write_text(json.dumps([{"url": "https://example"}]))
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            @staticmethod
+            def read(_):
+                return b"proxy.example:8080\n"
+
+        with patch.object(
+            settings, "DYNAMIC_PROXY_GENERATORS_FILE", config
+        ), patch.object(harvest.urllib.request, "urlopen", return_value=Response()):
+            self.assertEqual(harvest.dynamic_routes(), [])
+
+    def test_dynamic_generator_alternates_with_static_routes(self):
+        routes = [
+            {"key": "generator:rotating", "name": "dynamic"},
+            {"key": "clash:1", "name": "static-1"},
+            {"key": "clash:2", "name": "static-2"},
+        ]
+        self.assertEqual(harvest.order_routes(routes, {})[0]["key"], "generator:rotating")
+        state = {"last_route": "generator:rotating", "cursor": 1}
+        self.assertEqual(harvest.order_routes(routes, state)[0]["key"], "clash:1")
+        state = {"last_route": "clash:1", "cursor": 2}
+        self.assertEqual(harvest.order_routes(routes, state)[0]["key"], "generator:rotating")
 
 
 if __name__ == "__main__":

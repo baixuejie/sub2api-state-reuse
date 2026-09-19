@@ -20,15 +20,17 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const pluginID = "local.flownode.state-reuse"
-const version = "1.0.12"
+const version = "1.0.13"
 const stateHeader = "X-Codex-Turn-State"
 const dataDir = "/app/data/fn-state-reuse"
+const businessConcurrencyPerAccount = 2
 
 type Config struct {
 	ProxyURL        string  `json:"proxy_url"`
@@ -55,6 +57,8 @@ type Plugin struct {
 	entries               map[string]*Entry
 	client                *http.Client
 	businessClientFactory func(string) (*http.Client, error)
+	businessSlots         map[int64]chan struct{}
+	businessBackoff       map[int64]time.Time
 	store                 string
 	slots                 chan struct{}
 	reused                int
@@ -63,7 +67,7 @@ type Plugin struct {
 }
 
 func NewPlugin(store string) *Plugin {
-	return &Plugin{entries: map[string]*Entry{}, store: store, slots: make(chan struct{}, 3)}
+	return &Plugin{entries: map[string]*Entry{}, businessSlots: map[int64]chan struct{}{}, businessBackoff: map[int64]time.Time{}, store: store, slots: make(chan struct{}, 3)}
 }
 func capability() v2.Capability {
 	return v2.Capability{ID: v2.CapabilityProtectionTransport, Kind: v2.CapabilityKindProvider, Platform: "openai", AccountType: "oauth", Permissions: []v2.Permission{v2.PermissionRequestMetadata, v2.PermissionRequestBody, v2.PermissionCredentialsForward, v2.PermissionNetworkOutbound, v2.PermissionAccountProtection, v2.PermissionOriginalRequest}, TimeoutMS: 120000, FailureMode: v2.FailureModeClosed, Synchronous: true}
@@ -297,6 +301,22 @@ func (p *Plugin) businessClient(proxyURL string) (*http.Client, error) {
 	return &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, nil
 }
 
+func (p *Plugin) acquireBusiness(ctx context.Context, accountID int64) (func(), error) {
+	p.mu.Lock()
+	slot := p.businessSlots[accountID]
+	if slot == nil {
+		slot = make(chan struct{}, businessConcurrencyPerAccount)
+		p.businessSlots[accountID] = slot
+	}
+	p.mu.Unlock()
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (p *Plugin) ticket(ctx context.Context, id int64, model string, headers http.Header) (Ticket, error) {
 	hash := identity(headers)
 	k := key(id, model, hash)
@@ -516,6 +536,21 @@ func (p *Plugin) Forward(stream grpc.BidiStreamingServer[v1.ForwardRequest, v1.F
 	if !enabled {
 		return fail("account_outside_scope", false)
 	}
+	releaseBusiness, waitErr := p.acquireBusiness(stream.Context(), start.AccountId)
+	if waitErr != nil {
+		return fail("account_concurrency_wait_canceled", false)
+	}
+	defer releaseBusiness()
+	p.mu.Lock()
+	until := p.businessBackoff[start.AccountId]
+	p.mu.Unlock()
+	if time.Now().Before(until) {
+		seconds := int(time.Until(until).Seconds()) + 1
+		if err := stream.Send(&v1.ForwardResponse{Frame: &v1.ForwardResponse_Start{Start: &v1.ForwardResponseStart{StatusCode: 429, Status: "429 Too Many Requests", Protocol: "HTTP/1.1", ProtocolMajor: 1, ProtocolMinor: 1, Headers: map[string]*v1.HeaderValues{"Retry-After": {Values: []string{strconv.Itoa(seconds)}}}}}}); err != nil {
+			return err
+		}
+		return stream.Send(&v1.ForwardResponse{Frame: &v1.ForwardResponse_End{End: &v1.ForwardResponseEnd{}}})
+	}
 	if protected {
 		if metadata.Model == "" {
 			return fail("missing_model", false)
@@ -556,6 +591,7 @@ func (p *Plugin) Forward(stream grpc.BidiStreamingServer[v1.ForwardRequest, v1.F
 			p.audit("unprotected_forward", Ticket{AccountID: start.AccountId, Model: metadata.Model}, "no valid ticket; forward normally")
 		}
 	}
+
 	// No automatic retries and no redirect following after the business request is sent.
 	began := time.Now()
 	businessClient, ce := p.businessClient(start.ProxyUrl)
@@ -571,6 +607,22 @@ func (p *Plugin) Forward(stream grpc.BidiStreamingServer[v1.ForwardRequest, v1.F
 		return fail("upstream_transport_error", true)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == 429 {
+		until := time.Now().Add(5 * time.Minute)
+		if seconds, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && seconds > 0 {
+			candidate := time.Now().Add(time.Duration(seconds) * time.Second)
+			if candidate.After(until) {
+				until = candidate
+			}
+		} else if candidate, err := http.ParseTime(resp.Header.Get("Retry-After")); err == nil && candidate.After(until) {
+			until = candidate
+		}
+		p.mu.Lock()
+		if until.After(p.businessBackoff[start.AccountId]) {
+			p.businessBackoff[start.AccountId] = until
+		}
+		p.mu.Unlock()
+	}
 	hdr := map[string]*v1.HeaderValues{}
 	for k, v := range resp.Header {
 		hdr[k] = &v1.HeaderValues{Values: v}
@@ -585,10 +637,14 @@ func (p *Plugin) Forward(stream grpc.BidiStreamingServer[v1.ForwardRequest, v1.F
 		p.mu.Unlock()
 		if entry != nil {
 			entry.mu.Lock()
-			_ = p.persist(key(t.AccountID, t.Model, t.CredentialHash), Ticket{})
-			entry.ticket = Ticket{}
-			entry.cooldown = time.Now().Add(5 * time.Minute)
-			entry.blocked = resp.StatusCode != 429
+			if entry.ticket.Value == t.Value && entry.ticket.Issued == t.Issued {
+				entry.cooldown = time.Now().Add(5 * time.Minute)
+				if resp.StatusCode != 429 {
+					_ = p.persist(key(t.AccountID, t.Model, t.CredentialHash), Ticket{})
+					entry.ticket = Ticket{}
+					entry.blocked = true
+				}
+			}
 			entry.mu.Unlock()
 		}
 	}

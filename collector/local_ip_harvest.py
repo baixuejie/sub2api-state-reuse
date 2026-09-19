@@ -1,5 +1,7 @@
 import os, datetime
+import ipaddress
 import json, time, subprocess, tempfile, pathlib, urllib.parse
+import urllib.request
 import ticket_store as mh
 import settings
 
@@ -194,6 +196,42 @@ def request(a, r, ticket=None):
         return out, value
 
 
+def dynamic_routes():
+    if not settings.DYNAMIC_PROXY_GENERATORS_FILE.exists():
+        return []
+    try:
+        generators = json.loads(settings.DYNAMIC_PROXY_GENERATORS_FILE.read_text())
+    except (OSError, ValueError):
+        return []
+    routes = []
+    for index, generator in enumerate(generators):
+        try:
+            with urllib.request.urlopen(generator["url"], timeout=10) as response:
+                raw = response.read(4097)
+            if len(raw) > 4096:
+                continue
+            endpoint = next(
+                (line.strip() for line in raw.decode().splitlines() if line.strip()),
+                "",
+            )
+            host, port_text = endpoint.rsplit(":", 1)
+            ipaddress.ip_address(host)
+            port = int(port_text)
+            if not 1 <= port <= 65535:
+                continue
+            name = str(generator.get("name") or f"generator-{index + 1}")
+            routes.append(
+                {
+                    "key": "generator:" + name,
+                    "name": "动态IP/" + name,
+                    "url": "http://" + endpoint,
+                }
+            )
+        except (OSError, ValueError, KeyError, UnicodeError):
+            continue
+    return routes
+
+
 def routes_for(m):
     proxies = m.sql(
         "select coalesce(json_agg(row_to_json(p)),'[]'::json) from proxies p where status='active' and deleted_at is null and (expires_at is null or expires_at>now())"
@@ -240,7 +278,7 @@ def routes_for(m):
             merged.append(routes[i])
         if i < len(ip):
             merged.append(ip[i])
-    return merged
+    return dynamic_routes() + merged
 
 
 def order_routes(routes, st):
@@ -251,6 +289,9 @@ def order_routes(routes, st):
     preferred = next((r for r in routes if r["key"] == st.get("preferred")), None)
     if preferred:
         ordered = [preferred] + [r for r in ordered if r != preferred]
+    dynamic = next((r for r in routes if r["key"].startswith("generator:")), None)
+    if dynamic and not preferred and dynamic["key"] != st.get("last_route"):
+        ordered = [dynamic] + [r for r in ordered if r != dynamic]
     # Never pin a failed account to the same preferred route.
     if len(routes) > 1:
         ordered = [r for r in ordered if r["key"] != st.get("last_route")]

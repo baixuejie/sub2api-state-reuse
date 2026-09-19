@@ -91,7 +91,7 @@ sudo systemctl enable --now state-proxy.socket
 
 `plugin/main.go` 的版本和 `plugin/cmd/pack/main.go` 打包版本必须一致。打包器会检查runtime版本声明，避免宿主以“清单与运行时不一致”拒绝加载。
 
-当前公开版本1.0.12对生产派生版本1.0.11的适配差异：
+当前公开版本1.0.13对生产派生版本1.0.11的适配差异：
 
 - 不再把 `proxy_url` 固定为某个生产Docker网关；显式要求提供有效HTTP/HTTPS/SOCKS5/SOCKS5H代理。
 - Python的目录、管理API、容器名、插件ID、分组与UID/GID集中在环境配置。
