@@ -14,3 +14,9 @@ See LICENSE (LGPL-3.0) and COPYING (GPL-3.0 terms incorporated by LGPL-3.0).
 Local modifications include 292/332 ticket validation, credential-isolated
 candidate persistence, runtime/manifest version checks, configurable deployment
 settings, collection events and the same-origin administrator monitor.
+
+This fork additionally provides a v1 transport adapter for the original Sub2API
+host, model-isolated Astra/Sol ticket collection, automatic OAuth enrollment,
+ticket-based account scheduling, plugin-switch-controlled automation and a
+model-specific administrator monitor. Deployment secrets and operator-specific
+runtime records are not included.

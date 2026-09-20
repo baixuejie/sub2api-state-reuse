@@ -1,5 +1,7 @@
 # 应该怎么改
 
+本 Fork 的 `local/sub2api-v1` 分支面向原作者 Sub2API v1 插件宿主，增加了 `plugin/v1_adapter.go`、双模型采集、自动入队和账号调度同步。下面保留的 v2 宿主适配背景来自原项目；本分支实际安装步骤及开关以根目录 [README.md](../README.md) 为准。不要向 v1 宿主调用 `/admin/plugins/:id/routing`，当前通过账号 `schedulable` API 控制调度。
+
 ## 优先改配置，不改源码
 
 先把 `deploy/config.env.example` 复制到服务器 `/etc/sub2api-state-reuse/config.env`。服务器地址不写在源代码里；SSH 使用你自己的别名，代理凭据来自号池 IP 管理，Clash 原始订阅留在你自己的本机。
@@ -56,7 +58,7 @@ sudo systemctl enable --now state-proxy.socket
 
 ## 采集规则
 
-默认固定请求 `gpt-6-astra`。292/332含义及实际响应模型是经验判断，不是能力评分。
+本分支探测 `gpt-6-astra` 和 `gpt-5.6-sol`，默认仅 Astra 票据影响账号调度。292/332 含义及实际响应模型是经验判断，不是能力评分。
 
 | 规则 | 代码位置 |
 |---|---|

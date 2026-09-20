@@ -471,7 +471,7 @@ func (p *Plugin) Forward(stream grpc.BidiStreamingServer[v1.ForwardRequest, v1.F
 		return errorFrame(stream, code, sent)
 	}
 	u, e := url.Parse(start.Url)
-	if e != nil || u.Scheme != "https" || u.Host != "chatgpt.com" || !strings.HasPrefix(u.Path, "/backend-api/codex/") {
+	if e != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
 		return fail("invalid_upstream", false)
 	}
 	var body bytes.Buffer
@@ -501,26 +501,28 @@ func (p *Plugin) Forward(stream grpc.BidiStreamingServer[v1.ForwardRequest, v1.F
 		req.Header[k] = append([]string{}, v.Values...)
 	}
 	req.Host = start.Host
-	var metadata struct {
-		Model string `json:"model"`
-	}
-	if len(body.Bytes()) > 0 && json.Unmarshal(body.Bytes(), &metadata) != nil {
-		return fail("invalid_body", false)
-	}
 	p.mu.Lock()
 	enabled := contains(p.config.Accounts, start.AccountId)
 	client := p.client
 	p.mu.Unlock()
 	var t Ticket
-	protected := enabled && start.Method == "POST" && (strings.HasSuffix(u.Path, "/responses") || strings.HasSuffix(u.Path, "/responses/compact"))
-	if !enabled {
-		return fail("account_outside_scope", false)
+	// The v1 host routes all OAuth transport through one plugin. Only selected
+	// Codex requests may use tickets; other requests retain their original body
+	// and headers and use the business proxy supplied by the host.
+	protected := enabled && u.Scheme == "https" && u.Host == "chatgpt.com" &&
+		strings.HasPrefix(u.Path, "/backend-api/codex/") && start.Method == "POST" &&
+		(strings.HasSuffix(u.Path, "/responses") || strings.HasSuffix(u.Path, "/responses/compact"))
+	var metadata struct {
+		Model string `json:"model"`
+	}
+	if protected && json.Unmarshal(body.Bytes(), &metadata) != nil {
+		return fail("invalid_body", false)
 	}
 	if protected {
 		if metadata.Model == "" {
 			return fail("missing_model", false)
 		}
-		if metadata.Model == "gpt-6-astra" {
+		if metadata.Model == "gpt-6-astra" || metadata.Model == "gpt-5.6-sol" {
 			t, e = p.ticket(withProxy(stream.Context(), start.ProxyUrl), start.AccountId, metadata.Model, req.Header)
 		} else {
 			p.mu.Lock()
@@ -618,4 +620,4 @@ func isTimeout(err error) bool {
 	var e interface{ Timeout() bool }
 	return errors.As(err, &e) && e.Timeout()
 }
-func main() { v2.Serve(NewPlugin(filepath.Join(dataDir, "tickets.json"))) }
+func main() { v1.Serve(&v1Adapter{plugin: NewPlugin(filepath.Join(dataDir, "tickets.json"))}) }

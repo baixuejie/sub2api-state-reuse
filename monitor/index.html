@@ -190,6 +190,19 @@
         text-align: center;
         color: var(--muted);
       }
+      .sub { display:block; color:var(--muted); font-size:12px; margin-top:6px; white-space:normal; overflow-wrap:anywhere; }
+      .model-cell { min-width:260px; max-width:390px; }
+      .model-title { color:var(--blue); font-size:11px; letter-spacing:1px; }
+      .summary { display:flex; gap:12px; flex-wrap:wrap; margin:0 0 18px; }
+      .summary span { padding:6px 11px; border:1px solid var(--line); border-radius:8px; color:var(--muted); }
+      .meter { height:4px; border-radius:4px; background:#27344c; margin-top:10px; overflow:hidden; }
+      .meter i { display:block; height:100%; background:var(--green); }
+      .attention { color:#ffd28a; }
+      .count { color:var(--muted); font-size:12px; font-weight:400; }
+      button:focus-visible, select:focus-visible, a:focus-visible, input:focus-visible { outline:2px solid var(--blue); outline-offset:3px; }
+      .wide { min-width:840px; }
+      .metric strong small { font-size:14px; font-weight:400; color:var(--muted); }
+      .table-note { padding:12px 20px; margin:0; font-size:12px; border-top:1px solid var(--line); }
       @media (max-width: 700px) {
         main {
           padding: 20px 12px;
@@ -219,33 +232,34 @@
       <header>
         <div>
           <div class="eyebrow">SUB2API / STATE</div>
-          <h1>采集实时日志</h1>
-          <p>本地 Clash + IP 管理 · 292 / 332 · Astra 完整响应与携票复验</p>
+          <h1>模型票据与调度</h1>
+          <p>Astra 与 Sol 独立采集、携票复验。每个账号的两种票据一眼可见。</p>
         </div>
         <a href="/admin/accounts">返回账号管理 ↗</a>
       </header>
-      <div id="notice" role="status"></div>
+      <div id="notice" role="status" aria-live="polite"></div>
       <section class="metrics" aria-label="采集概要">
         <div class="metric">
-          <span>有效票据账号</span><strong id="ready">—</strong>
+          <span>可调度账号</span><strong id="ready">—</strong>
         </div>
         <div class="metric">
-          <span>等待采集</span><strong id="missing">—</strong>
+          <span>Astra 有效票据</span><strong id="astra-ready">—</strong>
         </div>
         <div class="metric">
-          <span>暂停账号</span><strong id="paused">—</strong>
+          <span>Sol 有效票据</span><strong id="sol-ready">—</strong>
         </div>
         <div class="metric">
-          <span>最近采集检查</span
-          ><strong id="checked" style="font-size: 20px">—</strong>
+          <span>等待 Astra 票据的账号</span><strong id="missing">—</strong>
         </div>
       </section>
+      <div class="summary"><span id="policy">正在读取调度规则…</span><span id="checked">最近检查：—</span><span id="paused">账号暂停：—</span></div>
       <section class="panel">
         <div class="bar">
-          <h2>账号状态</h2>
-          <span class="muted" id="policy"
-            >每20秒检查 · 缺票20秒换一个出口 · 续票间隔5分钟</span
-          >
+          <h2>账号总览 <span id="account-count" class="count"></span></h2>
+          <div class="controls">
+            <label>搜索 <input id="account-search" type="search" placeholder="账号名称或 ID" aria-label="搜索账号名称或 ID" /></label>
+            <label>状态 <select id="state-filter"><option value="">全部账号</option><option value="ready">可调度</option><option value="waiting">等待票据</option><option value="paused">账号暂停</option></select></label>
+          </div>
         </div>
         <div
           class="scroll"
@@ -253,19 +267,19 @@
           role="region"
           aria-label="可滚动数据表"
         >
-          <table>
+          <table class="wide">
             <thead>
               <tr>
-                <th>账号</th>
-                <th>状态</th>
-                <th>票据长度</th>
-                <th>到期时间</th>
-                <th>下次尝试 / 续票</th>
+                <th scope="col">账号</th>
+                <th scope="col">业务调度</th>
+                <th scope="col">GPT-6 Astra</th>
+                <th scope="col">GPT-5.6 Sol</th>
               </tr>
             </thead>
             <tbody id="accounts"></tbody>
           </table>
         </div>
+        <p class="table-note muted">票据按账号、模型与凭据分别保存。动态代理的实际换 IP 周期由代理商决定；同一账号的两个模型依次探测。</p>
       </section>
       <section class="panel">
         <div class="bar">
@@ -276,6 +290,9 @@
               <select id="account-filter">
                 <option value="">全部</option>
               </select></label
+            ><label
+              >模型
+              <select id="model-filter"><option value="">全部模型</option><option value="gpt-6-astra">Astra</option><option value="gpt-5.6-sol">Sol</option></select></label
             ><label
               >结果
               <select id="result-filter">
@@ -298,6 +315,7 @@
               <tr>
                 <th>时间</th>
                 <th>账号</th>
+                <th>探测模型</th>
                 <th>阶段</th>
                 <th>出口</th>
                 <th>结果</th>
@@ -310,8 +328,7 @@
       </section>
       <p class="footer" id="updated">正在连接…</p>
       <p class="footer">
-        只展示最近 500 条脱敏事件。候选通过携票复验后才入库；HTTP 200
-        本身不代表采集成功。Clash 出口依赖本地 Mac 在线。
+        显示最近 500 条脱敏事件。只有完整返回目标模型、票据校验与携票复验均通过才入库。HTTP 200 本身不代表采集成功，票据也不是模型能力保证。
       </p>
     </main>
   </body>

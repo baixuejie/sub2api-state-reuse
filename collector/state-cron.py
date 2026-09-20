@@ -5,6 +5,8 @@ import local_ip_harvest
 import sys
 import base64, concurrent.futures, datetime, fcntl, hashlib, json, os, pathlib, subprocess, time, urllib.request, urllib.error
 import settings
+import fnmatch
+from automation import AutomationStopped, PluginSwitch
 
 ROOT = settings.ROOT
 STORE = settings.STORE
@@ -63,6 +65,8 @@ def login():
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
             env[k] = v.strip().strip('"').strip("'")
+    if env.get("ADMIN_API_KEY"):
+        return {"api_key": env["ADMIN_API_KEY"]}
     d = call(
         "/auth/login",
         "POST",
@@ -74,9 +78,11 @@ def login():
     return token
 
 
-def call(path, method="GET", data=None, token=None, stream=False):
+def call(path, method="GET", data=None, token=None, stream=False, should_run=None):
     h = {"Content-Type": "application/json"}
-    if token:
+    if isinstance(token, dict):
+        h["x-api-key"] = token["api_key"]
+    elif token:
         h["Authorization"] = "Bearer " + token
     r = urllib.request.Request(
         settings.BASE_URL + path,
@@ -90,6 +96,8 @@ def call(path, method="GET", data=None, token=None, stream=False):
         ok = False
         error = False
         for line in f:
+            if should_run is not None and not should_run():
+                raise AutomationStopped()
             if not line.startswith(b"data:"):
                 continue
             try:
@@ -126,7 +134,87 @@ def get_tickets():
         return []
 
 
-def sync_groups(accounts, tickets, token):
+def accounts_from_plugin(cfg):
+    ids = cfg.get("accounts") or []
+    if not ids or any(type(i) is not int or i <= 0 for i in ids):
+        raise RuntimeError("plugin account scope must be explicit and nonempty")
+    scope = ",".join(str(i) for i in sorted(set(ids)))
+    schedule_filter = "" if settings.TICKET_SCHEDULING else " AND a.schedulable"
+    return sql("""SELECT coalesce(json_agg(json_build_object(
+        'id',a.id,'name',a.name,'platform',a.platform,'type',a.type,'status',a.status,
+        'schedulable',a.schedulable,
+        'eligible',(a.status='active'""" + schedule_filter + """
+            AND (a.rate_limit_reset_at IS NULL OR a.rate_limit_reset_at<now())
+            AND (a.overload_until IS NULL OR a.overload_until<now())
+            AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until<now())
+            AND (a.expires_at IS NULL OR a.expires_at>now())),
+        'token',a.credentials->>'access_token',
+        'account',a.credentials->>'chatgpt_account_id',
+        'plan',a.credentials->>'plan_type','mapping',a.credentials->'model_mapping'
+    )), '[]'::json) FROM accounts a WHERE a.deleted_at IS NULL
+    AND a.platform='openai' AND a.type='oauth' AND a.id IN (""" + scope + ")")
+
+
+def prepare_accounts(accounts, cfg):
+    for account in accounts:
+        account["eligible"] = bool(
+            account["eligible"]
+            and account["platform"] == "openai"
+            and account["type"] == "oauth"
+            and account["token"]
+            and account["account"]
+            and (settings.ACCOUNT_SCOPE != "plugin" or account["id"] not in (cfg.get("suspended") or []))
+        )
+        account["hash"] = hashlib.sha256(
+            ((account["token"] or "") + ":" + (account["account"] or "")).encode()
+        ).hexdigest()
+
+
+def model_enabled(account, model):
+    mapping = account.get("mapping") or {}
+    return not mapping or any(fnmatch.fnmatchcase(model, pattern) for pattern in mapping)
+
+
+def model_summary(account, model, tickets, state, now):
+    candidates = [t for t in tickets if t.get("account_id") == account["id"]
+                  and t.get("model") == model and valid(t, account, now)]
+    newest = max(candidates, key=lambda t: t["issued"]) if candidates else None
+    status = "fresh" if newest and now < newest["issued"] + 3000 else "renew_due" if newest else "missing"
+    shared = local_ip_harvest.shared_pause(state.get("local_ip_harvest", {}), account)
+    model_state = state.get("local_ip_harvest", {}).get(local_ip_harvest.model_key(account, model), {})
+    auth_block = bool(shared.get("auth_block") or model_state.get("auth_block"))
+    if not account["eligible"] or auth_block:
+        status = "paused"
+    elif not model_enabled(account, model):
+        status = "model_not_enabled"
+    last = state.get("last_results", {}).get(f"{account['id']}:{model}")
+    return {"account_id": account["id"], "account_name": account.get("name", ""),
+        "plan": account.get("plan"), "model": model, "status": status,
+        "expires_at": newest["issued"] + 3570 if newest else None,
+        "issued_at": newest["issued"] if newest else None,
+        "length": len(newest["value"]) if newest else None,
+        "next_attempt": max(state["attempts"].get(f"{account['id']}:{model}", 0)
+            + local_ip_harvest.retry_interval(status), model_state.get("next_attempt", 0), shared.get("next_attempt", 0)),
+        "auth_block": auth_block, "last_probe": last}
+
+
+def collection_routes(cfg):
+    if settings.PROXY_SOURCE != "plugin":
+        return local_ip_harvest.routes_for(sys.modules[__name__])
+    from urllib.parse import urlsplit, urlunsplit
+
+    raw = cfg.get("proxy_url") or ""
+    proxy = urlsplit(raw)
+    if proxy.scheme not in ("http", "https", "socks5", "socks5h") or not proxy.hostname:
+        raise RuntimeError("plugin harvest proxy is missing or invalid")
+    if proxy.scheme == "socks5":
+        raw = urlunsplit(proxy._replace(scheme="socks5h"))
+    return [{"key": "plugin-proxy", "name": "已配置采集代理", "url": raw}]
+
+
+def sync_groups(accounts, tickets, token, switch=None):
+    if not settings.AUTO_GROUP:
+        return
     groups = sql(
         "select json_agg(json_build_object('id',id,'name',name)) from groups where name in ('不降智分组','降智分组') and deleted_at is null"
     )
@@ -147,6 +235,8 @@ def sync_groups(accounts, tickets, token):
         )
         desired = sorted((set(current) - {good, bad}) | {good if ready else bad})
         if sorted(current) != desired:
+            if switch is not None:
+                switch.require()
             call(
                 f"/admin/accounts/{a['id']}",
                 "PUT",
@@ -169,43 +259,47 @@ def run():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return
-        run_locked()
+        try:
+            run_locked()
+        except AutomationStopped:
+            log("automation_paused")
 
 
 def run_locked():
-    if settings.READY_GROUP == settings.FALLBACK_GROUP:
+    if settings.AUTO_GROUP and settings.READY_GROUP == settings.FALLBACK_GROUP:
         raise RuntimeError("ready and fallback groups must differ")
     now = int(time.time())
-    q = """select json_build_object('groups',(select json_agg(json_build_object('id',id,'name',name)) from groups where name='不降智分组' and deleted_at is null),'accounts',(select coalesce(json_agg(json_build_object('id',a.id,'platform',a.platform,'type',a.type,'status',a.status,'schedulable',a.schedulable,'eligible',(a.status='active' and a.schedulable and (a.rate_limit_reset_at is null or a.rate_limit_reset_at<now()) and (a.overload_until is null or a.overload_until<now()) and (a.temp_unschedulable_until is null or a.temp_unschedulable_until<now()) and (a.expires_at is null or a.expires_at>now())),'token',a.credentials->>'access_token','account',a.credentials->>'chatgpt_account_id','plan',a.credentials->>'plan_type','mapping',a.credentials->'model_mapping')), '[]'::json) from accounts a where a.deleted_at is null and exists(select 1 from account_groups ag join groups g on g.id=ag.group_id where ag.account_id=a.id and g.name in ('不降智分组','降智分组') and g.deleted_at is null)))"""
-    d = sql(q)
-    groups = d["groups"] or []
-    if len(groups) != 1:
-        raise RuntimeError("target group missing or ambiguous")
-    accounts = d["accounts"]
-    ids = sorted(a["id"] for a in accounts)
-    group_id = groups[0]["id"]
-    # Never send an empty account scope to the host: [] means every account.
-    if not ids:
-        raise RuntimeError("empty target group; existing protection kept unchanged")
-    for a in accounts:
-        a["eligible"] = bool(
-            a["eligible"]
-            and a["platform"] == "openai"
-            and a["type"] == "oauth"
-            and a["token"]
-            and a["account"]
-        )
-        a["hash"] = hashlib.sha256(
-            ((a["token"] or "") + ":" + (a["account"] or "")).encode()
-        ).hexdigest()
-    suspended = sorted(a["id"] for a in accounts if not a["eligible"])
     token = login()
-    plugin = call(f"/admin/plugins/{PLUGIN}", token=token)["data"]
+    switch = PluginSwitch(lambda: call(f"/admin/plugins/{PLUGIN}", token=token)["data"])
+    if not switch.enabled(force=True):
+        return
+    plugin = switch.plugin
     if plugin["plugin_key"] != "local.flownode.state-reuse":
         raise RuntimeError("plugin identity mismatch")
     if plugin["state"] != "enabled":
-        raise RuntimeError("plugin disabled; do not override manual stop")
+        log("plugin_disabled")
+        return
     cfg = call(f"/admin/plugins/{PLUGIN}/config", token=token)
+    switch.require()
+    q = """select json_build_object('groups',(select json_agg(json_build_object('id',id,'name',name)) from groups where name='不降智分组' and deleted_at is null),'accounts',(select coalesce(json_agg(json_build_object('id',a.id,'platform',a.platform,'type',a.type,'status',a.status,'schedulable',a.schedulable,'eligible',(a.status='active' and a.schedulable and (a.rate_limit_reset_at is null or a.rate_limit_reset_at<now()) and (a.overload_until is null or a.overload_until<now()) and (a.temp_unschedulable_until is null or a.temp_unschedulable_until<now()) and (a.expires_at is null or a.expires_at>now())),'token',a.credentials->>'access_token','account',a.credentials->>'chatgpt_account_id','plan',a.credentials->>'plan_type','mapping',a.credentials->'model_mapping')), '[]'::json) from accounts a where a.deleted_at is null and exists(select 1 from account_groups ag join groups g on g.id=ag.group_id where ag.account_id=a.id and g.name in ('不降智分组','降智分组') and g.deleted_at is null)))"""
+    if settings.ACCOUNT_SCOPE == "plugin":
+        if not cfg.get("accounts"):
+            return
+        accounts = accounts_from_plugin(cfg)
+        group_id = None
+    else:
+        d = sql(q)
+        groups = d["groups"] or []
+        if len(groups) != 1:
+            raise RuntimeError("target group missing or ambiguous")
+        accounts = d["accounts"]
+        group_id = groups[0]["id"]
+    ids = sorted(a["id"] for a in accounts)
+    # Never send an empty account scope to the host: [] means every account.
+    if not ids:
+        raise RuntimeError("empty target group; existing protection kept unchanged")
+    prepare_accounts(accounts, cfg)
+    suspended = sorted(a["id"] for a in accounts if not a["eligible"])
     # Retain previously protected accounts as well as current members; moving a group must not bypass protection.
     desired_ids = sorted(set(ids + cfg.get("accounts", [])))
     # Retain existing suspension for accounts outside this group.
@@ -213,89 +307,34 @@ def run_locked():
         set(suspended + [i for i in cfg.get("suspended", []) if i not in ids])
     )
     desired = dict(cfg, accounts=desired_ids, suspended=desired_suspended)
-    if desired != cfg:
+    if settings.ACCOUNT_SCOPE != "plugin" and desired != cfg:
+        switch.require()
         call(f"/admin/plugins/{PLUGIN}/config", "PUT", desired, token)
         log("config_sync", accounts=desired_ids, suspended=desired_suspended)
-    b = next(
-        b
+    # The original v1 host has no per-account routing API. Scope is enforced
+    # inside this plugin; non-selected accounts are forwarded without tickets.
+    if not any(
+        b["capability"] == "openai.oauth.outbound_transport.v1" and b.get("enabled")
         for b in plugin["bindings"]
-        if b["capability"] == "openai.oauth.protection_transport.v1"
-    )
-    if (
-        sorted(b["account_ids"]) != desired_ids
-        or b["group_ids"]
-        or b["user_ids"]
-        or b["rollout_percent"] != 100
     ):
-        plugin = call(f"/admin/plugins/{PLUGIN}", token=token)["data"]
-        call(
-            f"/admin/plugins/{PLUGIN}/routing",
-            "PUT",
-            {
-                "expected_updated_at": plugin["updated_at"],
-                "policies": [
-                    {
-                        "capability": b["capability"],
-                        "priority": 0,
-                        "account_ids": desired_ids,
-                        "group_ids": [],
-                        "user_ids": [],
-                        "rollout_percent": 100,
-                        "max_concurrency": 64,
-                        "timeout_ms": 0,
-                    }
-                ],
-            },
-            token,
-        )
-        log("routing_sync", accounts=desired_ids)
+        raise RuntimeError("v1 OAuth transport binding is not enabled")
     if plugin["state"] != "enabled":
         raise RuntimeError("plugin disabled; do not override manual stop")
     state = json.loads(STATE.read_text()) if STATE.exists() else {"attempts": {}}
     tickets = get_tickets()
-    sync_groups(accounts, tickets, token)
-    jobs = []
-    summary = []
-    for a in accounts:
-        models = {MODEL}
-        mapping = a.get("mapping") or {}
-        for model in sorted(models):
-            k = f"{a['id']}:{model}"
-            ts = [
-                t
-                for t in tickets
-                if t.get("account_id") == a["id"]
-                and t.get("model") == model
-                and valid(t, a, now)
-            ]
-            newest = max(ts, key=lambda t: t["issued"]) if ts else None
-            status = (
-                "fresh"
-                if newest and now < newest["issued"] + 3000
-                else "renew_due"
-                if newest
-                else "missing"
-            )
-            if not a["eligible"]:
-                status = "paused"
-            elif mapping and model not in mapping and "*" not in mapping:
-                status = "model_not_enabled"
-            summary.append(
-                {
-                    "account_id": a["id"],
-                    "model": model,
-                    "status": status,
-                    "expires_at": newest["issued"] + 3570 if newest else None,
-                }
-            )
-            if status in ("renew_due", "missing") and now - state["attempts"].get(
-                k, 0
-            ) >= local_ip_harvest.retry_interval(status):
-                jobs.append((a["id"], model, local_ip_harvest.retry_interval(status)))
-                state["attempts"][k] = now
+    sync_groups(accounts, tickets, token, switch)
+    jobs = {}
+    for account in accounts:
+        for model in settings.MODELS:
+            row = model_summary(account, model, tickets, state, now)
+            key = f"{account['id']}:{model}"
+            if row["status"] in ("renew_due", "missing") and row["next_attempt"] <= now:
+                jobs.setdefault(account["id"], []).append((account["id"], model,
+                    local_ip_harvest.retry_interval(row["status"])))
+                state["attempts"][key] = now
     atomic(STATE, state)
     results = []
-    routes = local_ip_harvest.routes_for(sys.modules[__name__])
+    routes = collection_routes(cfg)
     harvest_state = state.setdefault("local_ip_harvest", {})
     deadline = time.monotonic() + 150
 
@@ -303,24 +342,27 @@ def run_locked():
         id, model, interval = item
         a = next(a for a in accounts if a["id"] == id)
         result = local_ip_harvest.collect(
-            a, routes, harvest_state, STORE, deadline, interval=interval
+            a, routes, harvest_state, STORE, deadline, interval=interval,
+            should_run=switch.enabled, model=model,
         )
         # The cycle lock protects collection; all worker cooldowns are saved after the batch.
         ok = False
         if result.get("captured"):
             try:
+                switch.require()
                 ok = call(
                     f"/admin/accounts/{id}/test",
                     "POST",
-                    {"model_id": MODEL},
+                    {"model_id": model},
                     token,
                     stream=True,
+                    should_run=switch.enabled,
                 )
             except Exception:
                 pass
         renewed = any(
             t.get("account_id") == id
-            and t.get("model") == MODEL
+            and t.get("model") == model
             and valid(t, a, time.time())
             and t["issued"] >= now
             for t in get_tickets()
@@ -331,18 +373,34 @@ def run_locked():
         local_ip_harvest.emit(
             id,
             "account_finished",
+            model=model,
             captured=result.get("captured", False),
             renewed=renewed,
             test_success=ok,
         )
         return result
 
+    def account_worker(items):
+        # Keep one account's capture/verify sequence serial, so a 401/403/429
+        # from either model prevents the next model from sending more probes.
+        return [worker(item) for item in items]
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
-        for result in ex.map(worker, jobs):
-            results.append(result)
+        for batch in ex.map(account_worker, jobs.values()):
+            results.extend(batch)
+    for result in results:
+        if result.get("probes"):
+            probe = result["probes"][-1]
+            state.setdefault("last_results", {})[f"{result['account_id']}:{result['model']}"] = {
+                "at": time.time(), "http": probe.get("http"), "actual_model": probe.get("actual_model"),
+                "length": probe.get("length"), "phase": probe.get("phase"),
+                "completed": bool(probe.get("completed")), "transport_error": probe.get("transport_error"),
+                "error": probe.get("error"), "error_code": probe.get("error_code"),
+                "captured": bool(result.get("captured")), "renewed": bool(result.get("renewed"))}
     atomic(STATE, state)
     final = get_tickets()
-    sync_groups(accounts, final, token)
+    switch.require()
+    sync_groups(accounts, final, token, switch)
     a_by_id = {a["id"]: a for a in accounts}
     stored = []
     for t in final:
@@ -357,20 +415,15 @@ def run_locked():
                     "expires_at": t["issued"] + 3570,
                 }
             )
-    for row in summary:
-        a = a_by_id[row["account_id"]]
-        st = state.get("local_ip_harvest", {}).get(str(a["id"]) + ":" + a["hash"], {})
-        row["next_attempt"] = max(
-            state["attempts"].get(str(a["id"]) + ":" + MODEL, 0)
-            + local_ip_harvest.retry_interval(row["status"]),
-            st.get("next_attempt", 0),
-        )
-        row["auth_block"] = bool(st.get("auth_block", False))
+    summary = [model_summary(account, model, final, state, time.time())
+               for account in accounts for model in settings.MODELS]
     report = {
         "at": datetime.datetime.now().astimezone().isoformat(),
         "group_id": group_id,
-        "group_name": GROUP,
+        "group_name": GROUP if settings.AUTO_GROUP else None,
         "monitored_accounts": ids,
+        "models": list(settings.MODELS),
+        "required_models": list(settings.REQUIRED_MODELS),
         "members": [
             a["id"]
             for a in accounts

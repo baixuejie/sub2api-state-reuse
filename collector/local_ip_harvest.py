@@ -2,6 +2,7 @@ import os, datetime
 import json, time, subprocess, tempfile, pathlib, urllib.parse
 import ticket_store as mh
 import settings
+from automation import AutomationStopped
 
 MODEL = settings.MODEL
 EVENTS = settings.ROOT / "harvest-events.jsonl"
@@ -24,6 +25,9 @@ def emit(account_id, event, **fields):
         "test_success",
         "next_attempt",
         "auth_block",
+        "business_schedulable",
+        "scheduling_reason",
+        "model",
     )
     row = {
         "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -41,10 +45,38 @@ def emit(account_id, event, **fields):
     print(line.strip(), flush=True)
 
 
-def request(a, r, ticket=None):
-    out = {"source": r["name"], "phase": "verify" if ticket else "capture"}
+def run_curl(args, cfg, should_run=None):
+    if should_run is None:
+        return subprocess.run(args, input=cfg, text=True, capture_output=True, timeout=35)
+    if not should_run():
+        raise AutomationStopped()
+    with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as process:
+        deadline = time.monotonic() + 35
+        first = True
+        try:
+            while True:
+                if not should_run():
+                    raise AutomationStopped()
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(args, 35)
+                try:
+                    stdout, stderr = process.communicate(input=cfg if first else None, timeout=0.5)
+                    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    first = False
+        except BaseException:
+            process.kill()
+            process.communicate()
+            raise
+
+
+def request(a, r, ticket=None, should_run=None, model=MODEL):
+    if model not in settings.MODELS:
+        raise ValueError("unsupported probe model")
+    out = {"source": r["name"], "phase": "verify" if ticket else "capture", "model": model}
     body = {
-        "model": MODEL,
+        "model": model,
         "instructions": "Reply with OK.",
         "input": [
             {
@@ -95,7 +127,7 @@ def request(a, r, ticket=None):
             ]
             + ["header = " + q(k + ": " + v) for k, v in headers.items()]
         )
-        p = subprocess.run(
+        p = run_curl(
             [
                 "curl",
                 "--silent",
@@ -107,10 +139,8 @@ def request(a, r, ticket=None):
                 "--config",
                 "-",
             ],
-            input=cfg,
-            text=True,
-            capture_output=True,
-            timeout=35,
+            cfg,
+            should_run,
         )
         hs = h.read_text() if h.exists() else ""
         bs = b.read_text(errors="replace") if b.exists() else ""
@@ -261,22 +291,51 @@ def retry_interval(status):
     return 20 if status == "missing" else 300
 
 
-def collect(a, routes, state, store, deadline, interval=20):
-    st = state.setdefault(str(a["id"]) + ":" + a["hash"], {})
+def account_key(a):
+    return str(a["id"]) + ":" + a["hash"]
+
+
+def model_key(a, model):
+    # Keep the original Astra key so existing cooldowns and cursors survive.
+    return account_key(a) if model == MODEL else account_key(a) + ":" + model
+
+
+def shared_pause(state, a):
+    shared = dict(state.get("_account_backoff", {}).get(account_key(a), {}))
+    legacy = state.get(account_key(a), {})
+    # Respect previously persisted Astra authorization/quota cooldowns when
+    # introducing Sol. Changing model must never bypass those restrictions.
+    shared["auth_block"] = bool(shared.get("auth_block") or legacy.get("auth_block"))
+    shared["next_attempt"] = max(shared.get("next_attempt", 0),
+        0 if legacy.get("retry_scoped") else legacy.get("next_attempt", 0))
+    return shared
+
+
+def collect(a, routes, state, store, deadline, interval=20, should_run=None, model=MODEL):
+    legacy = state.get(account_key(a), {})
+    if legacy and not legacy.get("retry_scoped"):
+        state.setdefault("_account_backoff", {})[account_key(a)] = shared_pause(state, a)
+        legacy["retry_scoped"] = True
+    st = state.setdefault(model_key(a, model), {})
+    st["retry_scoped"] = True
+    shared = shared_pause(state, a)
     out = {
         "account_id": a["id"],
-        "model": MODEL,
+        "model": model,
         "captured": False,
         "probes": [],
         "harvest_proxy": "local-clash-and-ip-management",
     }
-    if st.get("auth_block") or st.get("next_attempt", 0) > time.time():
+    if should_run is not None and not should_run():
+        return dict(out, automation_stopped=True)
+    if st.get("auth_block") or shared.get("auth_block") or max(st.get("next_attempt", 0), shared.get("next_attempt", 0)) > time.time():
         out["paused"] = True
         emit(
             a["id"],
             "paused",
-            next_attempt=st.get("next_attempt"),
-            auth_block=st.get("auth_block", False),
+            next_attempt=max(st.get("next_attempt", 0), shared.get("next_attempt", 0)),
+            auth_block=bool(st.get("auth_block") or shared.get("auth_block")),
+            model=model,
         )
         return out
     if time.monotonic() > deadline:
@@ -284,6 +343,8 @@ def collect(a, routes, state, store, deadline, interval=20):
         return out
     st["next_attempt"] = time.time() + interval
     for route in order_routes(routes, st):
+        if should_run is not None and not should_run():
+            return dict(out, automation_stopped=True)
         if time.monotonic() + 65 > deadline:
             break
         st["cursor"] = (routes.index(route) + 1) % len(routes)
@@ -291,11 +352,13 @@ def collect(a, routes, state, store, deadline, interval=20):
         # Restore preference only after a new capture and carry-ticket verification.
         if st.get("preferred") == route["key"]:
             st.pop("preferred", None)
-        emit(a["id"], "attempt_started", source=route["name"], phase="capture")
+        emit(a["id"], "attempt_started", source=route["name"], phase="capture", model=model)
         try:
-            r, value = request(a, route)
+            r, value = request(a, route, should_run=should_run, model=model)
+        except AutomationStopped:
+            return dict(out, automation_stopped=True)
         except Exception as e:
-            r = {"source": route["name"], "error": type(e).__name__}
+            r = {"source": route["name"], "error": type(e).__name__, "model": model}
             value = ""
         out["probes"].append(r)
         emit(a["id"], "attempt_finished", **r)
@@ -304,15 +367,21 @@ def collect(a, routes, state, store, deadline, interval=20):
                 auth_block=r.get("auth_block", False),
                 next_attempt=time.time() + r.get("cooldown", 3600),
             )
+            state.setdefault("_account_backoff", {})[account_key(a)] = {
+                "auth_block": st["auth_block"], "next_attempt": st["next_attempt"]}
             break
-        t = mh.candidate(a, value)
-        if not (t and r.get("completed") and r.get("actual_model") == MODEL):
+        t = mh.candidate(a, value, model=model)
+        if not (t and r.get("completed") and r.get("actual_model") == model):
             continue
-        emit(a["id"], "attempt_started", source=route["name"], phase="verify")
+        if should_run is not None and not should_run():
+            return dict(out, automation_stopped=True)
+        emit(a["id"], "attempt_started", source=route["name"], phase="verify", model=model)
         try:
-            v, _ = request(a, route, value)
+            v, _ = request(a, route, value, should_run=should_run, model=model)
+        except AutomationStopped:
+            return dict(out, automation_stopped=True)
         except Exception as e:
-            v = {"source": route["name"], "error": type(e).__name__}
+            v = {"source": route["name"], "error": type(e).__name__, "model": model}
         out["probes"].append(v)
         emit(a["id"], "attempt_finished", **v)
         if v.get("stop"):
@@ -320,11 +389,15 @@ def collect(a, routes, state, store, deadline, interval=20):
                 auth_block=v.get("auth_block", False),
                 next_attempt=time.time() + v.get("cooldown", 3600),
             )
+            state.setdefault("_account_backoff", {})[account_key(a)] = {
+                "auth_block": st["auth_block"], "next_attempt": st["next_attempt"]}
             break
-        if v.get("completed") and v.get("actual_model") == MODEL:
+        if v.get("completed") and v.get("actual_model") == model:
+            if should_run is not None and not should_run():
+                return dict(out, automation_stopped=True)
             mh.queue_ticket(store, t)
             st["preferred"] = route["key"]
             out.update(captured=True, source=route["name"])
-            emit(a["id"], "candidate_queued", captured=True, source=route["name"])
+            emit(a["id"], "candidate_queued", captured=True, source=route["name"], model=model)
             break
     return out

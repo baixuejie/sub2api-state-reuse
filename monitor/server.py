@@ -25,6 +25,9 @@ FIELDS = {
     "test_success",
     "next_attempt",
     "auth_block",
+    "business_schedulable",
+    "scheduling_reason",
+    "model",
 }
 
 
@@ -64,36 +67,58 @@ def tail_events():
 
 
 def snapshot():
-    d = read_json("cron-status.json", {})
-    state = read_json("cron-state.json", {})
-    accounts = []
-    now = time.time()
-    for a in d.get("before", []):
-        aid = a.get("account_id")
-        item = {k: a.get(k) for k in ("account_id", "model", "status", "expires_at")}
-        item["next_attempt"] = a.get("next_attempt", 0)
-        item["auth_block"] = bool(a.get("auth_block", False))
-        accounts.append(item)
-    tickets = [
-        {
-            k: t.get(k)
-            for k in ("account_id", "model", "length", "issued_at", "expires_at")
-        }
-        for t in d.get("valid_tickets", [])
-    ]
+    data = read_json("cron-status.json", {})
+    scheduling = read_json("scheduling-status.json", {})
+    automation = read_json("automation-status.json", {})
+    models = data.get("models") or ["gpt-6-astra", "gpt-5.6-sol"]
+    gates = {row["account_id"]: row for row in scheduling.get("accounts", [])}
+    events = tail_events()
+    # Historical events predate model tags; those probes were Astra-only.
+    for event in events:
+        if not event.get("model") and event.get("event") in {
+            "attempt_started", "attempt_finished", "candidate_queued", "account_finished", "paused"
+        }:
+            event["model"] = "gpt-6-astra"
+    accounts = {}
+    for row in data.get("before", []):
+        aid = row.get("account_id")
+        if not isinstance(aid, int):
+            continue
+        account = accounts.setdefault(aid, {"account_id": aid,
+            "account_name": row.get("account_name") or "", "plan": row.get("plan"), "models": {}})
+        model = row.get("model") or "gpt-6-astra"
+        detail = {key: row.get(key) for key in (
+            "status", "expires_at", "issued_at", "length", "next_attempt", "auth_block")}
+        last = row.get("last_probe")
+        if isinstance(last, dict):
+            detail["last_probe"] = {key: last.get(key) for key in (
+                "at", "http", "actual_model", "length", "phase", "completed", "transport_error",
+                "error", "error_code", "captured", "renewed")}
+        account["models"][model] = detail
+    for aid, gate in gates.items():
+        account = accounts.setdefault(aid, {"account_id": aid, "account_name": "", "models": {}})
+        for key in ("business_schedulable", "scheduling_reason", "required_models", "missing_models"):
+            if key in gate:
+                account[key] = gate[key]
+        for model, ticket in gate.get("model_tickets", {}).items():
+            if model in models:
+                account["models"].setdefault(model, {}).update(ticket)
+    tickets = [{key: ticket.get(key) for key in
+        ("account_id", "model", "length", "issued_at", "expires_at")}
+        for ticket in data.get("valid_tickets", [])]
+    for account in accounts.values():
+        for model in models:
+            account["models"].setdefault(model, {"status": "pending"})
     return {
-        "server_time": now,
-        "updated_at": d.get("at"),
-        "accounts": accounts,
-        "tickets": tickets,
-        "events": tail_events(),
-        "policy": {
-            "check_seconds": 20,
-            "account_interval": 20,
-            "renew_interval": 300,
-            "routes_per_cycle": 1,
-            "concurrency": 3,
-        },
+        "server_time": time.time(), "updated_at": data.get("at"),
+        "scheduling_updated_at": scheduling.get("at"),
+        "accounts": sorted(accounts.values(), key=lambda account: account["account_id"]),
+        "models": models, "tickets": tickets, "events": events,
+        "scheduling_enabled": scheduling.get("enabled", False) and automation.get("enabled", True),
+        "automation": automation,
+        "policy": {"check_seconds": 20, "account_interval": 20, "renew_interval": 300,
+            "routes_per_cycle": 1, "concurrency": 3,
+            "required_models": data.get("required_models") or ["gpt-6-astra"]},
     }
 
 
@@ -154,5 +179,5 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     http.server.ThreadingHTTPServer(
-        ("127.0.0.1", int(os.environ.get("STATE_MONITOR_PORT", "17843"))), Handler
+        (os.environ.get("STATE_MONITOR_HOST", "127.0.0.1"), int(os.environ.get("STATE_MONITOR_PORT", "17843"))), Handler
     ).serve_forever()

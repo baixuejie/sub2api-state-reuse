@@ -1,5 +1,9 @@
 # 升级、回退与运维
 
+本 Fork 的 v1 分支还部署 `state-scheduling.timer`，升级时应和 `state-collector.timer` 一起暂停，等待对应 service 结束。当前采集范围来自插件 `accounts`，账号调度由原作者宿主的 `schedulable` API 控制，不使用 v2 路由接口。部署参考根目录 [README.md](../README.md)。
+
+运行中重置管理 API Key 后，应同步更新服务器私有 `admin.env` 文件；否则自动化会因 401 暂停。日志页将提示管理接口不可用。不要把新旧密钥放入 Git。
+
 ## 上线前
 
 - 在隔离号池验证版本、插件能力、表结构与目录映射。

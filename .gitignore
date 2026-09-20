@@ -7,6 +7,7 @@ config.env
 routes.json
 mihomo.yaml
 *.key
+*.pub
 *.pem
 *.p12
 *.pfx
@@ -16,6 +17,15 @@ mihomo.yaml
 **/incoming/
 **/cron-state.json
 **/cron-status.json
+**/automation-status.json
+**/scheduling-status.json
+**/runtime/
+**/backups/
+**/config.yaml
+**/config.local.yaml
+**/deployment.json
+**/installation.json
+LOCAL-*.md
 *.jsonl
 *.log
 *.db

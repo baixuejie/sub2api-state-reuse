@@ -1,4 +1,4 @@
-.PHONY: test build check
+.PHONY: test build check test-ui
 
 test:
 	cd plugin && go test -race ./...
@@ -12,3 +12,7 @@ check:
 	python3 -m compileall -q collector monitor tests
 	node --check monitor/app.js
 	node --check monitor/entry.js
+
+# Provide jsdom through NODE_PATH when running this standalone monitor suite.
+test-ui:
+	node tests/monitor_ui.test.cjs

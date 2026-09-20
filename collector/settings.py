@@ -25,6 +25,17 @@ ROUTES_FILE = Path(
 PLUGIN_UID = int(os.environ.get("STATE_PLUGIN_UID", "1000"))
 PLUGIN_GID = int(os.environ.get("STATE_PLUGIN_GID", "1000"))
 MODEL = "gpt-6-astra"
+MODELS = (MODEL, "gpt-5.6-sol")
+# Astra remains the account scheduling requirement; Sol is independently probed.
+REQUIRED_MODELS = tuple(filter(None, os.environ.get("STATE_REQUIRED_MODELS", MODEL).split(",")))
+if not REQUIRED_MODELS or not set(REQUIRED_MODELS).issubset(MODELS):
+    raise ValueError("STATE_REQUIRED_MODELS must contain supported probe models")
+ACCOUNT_SCOPE = os.environ.get("STATE_ACCOUNT_SCOPE", "groups")
+AUTO_GROUP = os.environ.get("STATE_AUTO_GROUP", "true").lower() == "true"
+PROXY_SOURCE = os.environ.get("STATE_PROXY_SOURCE", "routes")
+TICKET_SCHEDULING = os.environ.get("STATE_TICKET_SCHEDULING", "false").lower() == "true"
+SCHEDULING_MARGIN = 30
+AUTO_ENROLL = os.environ.get("STATE_AUTO_ENROLL", "false").lower() == "true"
 
 
 def sql_literal(value):

@@ -1,0 +1,9 @@
+[Unit]
+Description=Check Sub2API ticket scheduling eligibility every 5 seconds
+[Timer]
+OnCalendar=*-*-* *:*:00/5
+AccuracySec=1s
+Persistent=true
+Unit=state-scheduling.service
+[Install]
+WantedBy=timers.target

@@ -6,7 +6,9 @@ import settings
 MODEL = settings.MODEL
 
 
-def candidate(a, value):
+def candidate(a, value, model=MODEL):
+    if model not in settings.MODELS:
+        return None
     try:
         b = base64.b64decode(value, altchars=b"-_", validate=True)
         issued = int.from_bytes(b[1:9], "big")
@@ -18,7 +20,7 @@ def candidate(a, value):
             return None
         return {
             "account_id": a["id"],
-            "model": MODEL,
+            "model": model,
             "credential_hash": a["hash"],
             "issued": issued,
             "value": value,
