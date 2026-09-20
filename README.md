@@ -4,6 +4,15 @@
 
 当前插件版本：`1.0.12+sub2api.v1.3`，已在 Sub2API `0.2.7` 上验证。原项目面向另一分支的 v2 宿主；两种插件协议不能混装。本仓库保留上游 SDK、来源声明和 LGPL-3.0 许可证。
 
+**插件和全部自动化脚本位于 [`local/sub2api-v1`](https://github.com/baixuejie/sub2api-state-reuse/tree/local/sub2api-v1) 分支。** `main` 保留原作者代码；请先切换分支再下载或开发：
+
+```bash
+git clone --branch local/sub2api-v1 https://github.com/baixuejie/sub2api-state-reuse.git
+cd sub2api-state-reuse
+```
+
+文档入口：[自动化脚本与任务关系](docs/AUTOMATION.md) · [运行、升级与排障](docs/OPERATIONS.md) · [二次开发](docs/CUSTOMIZATION.md)。
+
 ## 功能
 
 - **Astra / Sol 独立采集**：分别探测 `gpt-6-astra` 和 `gpt-5.6-sol`，按账号、模型与当前凭据隔离票据；不跨模型替换 `X-Codex-Turn-State`。
@@ -21,7 +30,10 @@
 | `plugin/` | Go 插件、v1 协议适配、签名打包器与 SDK |
 | `collector/state-cron.py` | 定时采集、携票复验与候选交接 |
 | `collector/scheduling.py` | 新账号入队及业务调度资格同步 |
-| `collector/automation.py` | 统一插件开关与运行中取消 |
+| `collector/automation.py` | 统一插件开关与运行中取消，由采集和调度脚本调用 |
+| `collector/local_ip_harvest.py` | 代理请求、模型验证、携票复验和冷却 |
+| `collector/ticket_store.py` | 票据校验与按模型隔离的候选文件交接 |
+| `collector/settings.py` | 统一读取部署环境配置 |
 | `monitor/` | 管理员监控 API、HTML 与 JavaScript |
 | `deploy/` | systemd、Nginx、日志轮转及占位配置模板 |
 | `tests/` | 使用模拟数据的采集、调度、权限及界面测试 |
@@ -82,11 +94,14 @@ sudo install -m 644 deploy/state-collector.service deploy/state-collector.timer 
   deploy/state-scheduling.service deploy/state-scheduling.timer \
   deploy/state-monitor.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl start state-scheduling.service state-collector.service
+sudo systemctl start state-scheduling.service
+sudo systemctl start state-collector.service
 sudo systemctl enable --now state-scheduling.timer state-collector.timer state-monitor.service
 ```
 
 首次手动执行会发出实际采集和复验请求并消耗账号额度。确认结果后启用 timer，日志可使用 `journalctl -u state-collector.service -f` 查看。默认使用 Docker CLI 读取账号，服务权限需与模板等价。
+
+上传插件不会自动安装以上 systemd 服务。`state-scheduling.timer` 每 5 秒处理新账号和业务调度，`state-collector.timer` 每 20 秒检查采集需求，`state-monitor.service` 常驻提供日志页面。`automation.py` 是共享模块，不需要单独启动，三者的完整说明见 [AUTOMATION.md](docs/AUTOMATION.md)。
 
 自动入队存在约 5 秒扫描间隔；主站导入瞬间的默认调度设置不会被脚本原子修改。若要求导入瞬间即不可调度，应在导入端先关闭调度。账号被停用、发生认证错误或额度冷却时，不会强行刷票。长期人工暂停应停用账号或加入插件 `suspended`，而不是仅关闭会被自动规则维护的 `schedulable`。
 

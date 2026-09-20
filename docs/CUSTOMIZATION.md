@@ -1,126 +1,72 @@
-# 应该怎么改
+# 二次开发与适配
 
-本 Fork 的 `local/sub2api-v1` 分支面向原作者 Sub2API v1 插件宿主，增加了 `plugin/v1_adapter.go`、双模型采集、自动入队和账号调度同步。下面保留的 v2 宿主适配背景来自原项目；本分支实际安装步骤及开关以根目录 [README.md](../README.md) 为准。不要向 v1 宿主调用 `/admin/plugins/:id/routing`，当前通过账号 `schedulable` API 控制调度。
+当前开发分支为 `local/sub2api-v1`，面向原作者 Sub2API v1 插件宿主。`main` 保留原作者版本。首次安装见 [README.md](../README.md)，脚本关系见 [AUTOMATION.md](AUTOMATION.md)。
 
-## 优先改配置，不改源码
+## 修改位置
 
-先把 `deploy/config.env.example` 复制到服务器 `/etc/sub2api-state-reuse/config.env`。服务器地址不写在源代码里；SSH 使用你自己的别名，代理凭据来自号池 IP 管理，Clash 原始订阅留在你自己的本机。
+| 需求 | 位置 | 生效方式 |
+| --- | --- | --- |
+| 主站 API、数据库容器、插件 ID、文件路径 | 私有 `config.env`；字段定义在 `collector/settings.py` | 下轮脚本读取；监控配置变化需重启服务 |
+| 管理 API Key | 私有 `admin.env` | 下轮读取，不写入 Git |
+| 采集代理、账号范围、暂停账号 | 主站插件配置 `proxy_url` / `accounts` / `suspended` | 运行中应用配置，采集器下轮读取 |
+| 自动入队条件、调度资格 | `collector/scheduling.py` | 等待当前调度轮结束后部署 |
+| 插件启停联动 | `collector/automation.py` | 同步采集与调度脚本后验证停用/恢复场景 |
+| 双模型探测、完整流和携票复验 | `collector/local_ip_harvest.py`、`collector/state-cron.py` | 等待当前采集结束后部署 |
+| 候选隔离与票据格式 | `collector/ticket_store.py`、`plugin/main.go` | Python / Go 规则必须一致，重新构建插件 |
+| v1 RPC / 运行时版本 | `plugin/v1_adapter.go` | 重新构建、签名并安装 |
+| 清单、签名和插件包名 | `plugin/cmd/pack/main.go` | 与运行时版本一致 |
+| 页面布局、筛选、文案 | `monitor/index.html`、`monitor/app.js` | 刷新页面；运行 DOM 测试 |
+| 监控鉴权、数据白名单 | `monitor/server.py` | 测试权限后重启 `state-monitor.service` |
+| 任务频率 | `deploy/*.timer` | 安装更新、daemon-reload 并重启对应 timer |
 
-| 你要改的内容 | 修改位置 | 生效方法 |
-|---|---|---|
-| 号池端口、PostgreSQL容器、插件ID、目标分组 | `config.env` | 下一轮采集读取；监控的API地址改动需重启monitor |
-| 票据宿主目录、容器UID/GID | `config.env` 和 Docker bind mount | 保证宿主与插件读同一份文件，先停定时器再调整 |
-| Clash节点与监听端口 | 私有mihomo配置、SSH `-R`、`routes.json` | 三者端口一致；重启核心/SSH，下一轮读取路由 |
-| 日志页面端口 | `STATE_MONITOR_PORT` 与 nginx upstream | 重启monitor、`nginx -t` 后 reload |
-| 管理员凭据 | `admin.env` | 下一轮登录读取，不写前端 |
-| 插件采集代理 | 后台插件配置 `proxy_url` | 该地址必须从容器可达 |
-| 页面文字/颜色/筛选 | `monitor/index.html`、`app.js` | 同步文件后刷新，服务每次直接读取文件 |
+不要把服务器地址、代理密码、管理员密钥写进以上源码。部署值通过私有文件或主站加密插件配置提供。
 
-## 代理与容器网络
+## 模型与票据规则
 
-宿主采集用 `127.0.0.1:18300`。插件在容器内，需要额外桥接。不要把一个仅监听宿主loopback的代理地址直接填进容器。
+探测清单是 `settings.MODELS` 中的 Astra 和 Sol；默认调度条件是 `STATE_REQUIRED_MODELS=gpt-6-astra`。增加模型时需要同时核对：
 
-一种可选实现：
+1. Python 请求的目标模型、完整响应判定与携票复验；不能只改显示名称。
+2. Go `Forward` 是否进入该模型的候选导入和票据注入路径。
+3. 候选与持久票据键中的账号、模型、凭据隔离，保留旧冷却状态。
+4. 调度条件是否仍只看指定模型，以及同账号限流如何跨模型生效。
+5. 监控数据、模型列和筛选，以及 Python / Go / DOM 测试。
 
-```ini
-# /etc/systemd/system/state-proxy.socket
-[Unit]
-Description=Clash access for the Sub2API container network
-[Socket]
-# 示例Docker网关；替换成你实际容器能到达的宿主地址。
-ListenStream=172.18.0.1:17892
-[Install]
-WantedBy=sockets.target
-```
+当前只接受 292 / 332 字符票据并检查时间与实际模型，不按套餐专门分流。Team 等套餐需用真实响应单独验证；不能直接把某个长度等同于某个套餐或能力。
 
-```ini
-# /etc/systemd/system/state-proxy.service
-[Unit]
-Description=Forward container proxy connections to the SSH loopback port
-Requires=state-proxy.socket
-After=state-proxy.socket
-[Service]
-# 可用 command -v / find 核对你系统的 systemd-socket-proxyd 安装路径。
-ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:18300
-NoNewPrivileges=true
-```
+## 宿主协议和代理
 
-确认 Docker 网关、绑定地址存在、目标 SSH 端口在线后：
+本分支清单声明 `openai.oauth.outbound_transport.v1`，通过 `plugin/v1_adapter.go` 暴露 v1 生命周期和转发 RPC。不要把 v2 的 `openai.oauth.protection_transport.v1` 清单直接上传到 v1 宿主，也不要调用不存在的 `/admin/plugins/:id/routing`。
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now state-proxy.socket
-```
+v1 宿主按 OAuth 类型和灰度范围将请求交给插件；插件内部对未选中账号正常转发，选中账号按对应模型注入票据。自动化通过主站正式 `schedulable` API 控制选账号阶段，不用 SQL 直接写调度状态。
 
-此示例插件 `proxy_url` 为 `http://172.18.0.1:17892`；不要照抄 `plugin-config.example.json` 的 `host.docker.internal`，除非你已经将该主机名映射到这个可达地址。监听绑定在专用Docker网关，并用防火墙限制来源；不要监听公网0.0.0.0。
+`proxy_url` 用于采票，业务请求仍使用宿主传入的账号代理 `ForwardRequestStart.proxy_url`。默认采集器也从插件配置读取代理；可选 `STATE_PROXY_SOURCE=routes` 读取 Clash 路由与 IP 管理，但必须保留账号冷却规则。宿主和容器的 loopback 地址不同，应分别验证可达性。
 
-代理分两类：`proxy_url` 仅用于插件采票；业务流量使用宿主传入 `ForwardRequestStart.proxy_url` 的账号代理。它们不能混用。开启“系统HTTP_PROXY”也不能替代账号业务代理的明确配置。
+SDK 目录保留原来源快照。适配其他主站分支时，应核对协议、管理 API、数据库只读查询字段、目录挂载与管理员角色，不要覆盖宿主生成代码来拼接协议。
 
-## 采集规则
+## 版本与测试
 
-本分支探测 `gpt-6-astra` 和 `gpt-5.6-sol`，默认仅 Astra 票据影响账号调度。292/332 含义及实际响应模型是经验判断，不是能力评分。
-
-| 规则 | 代码位置 |
-|---|---|
-| 接受292/332、时间戳与过期 | `collector/ticket_store.py::candidate`、`state-cron.py::valid`、`plugin/main.go::parseState/validTicket` |
-| 实际模型与完整流 | `collector/local_ip_harvest.py::request/collect`、`plugin/main.go::harvest` |
-| 携票第二次请求 | `local_ip_harvest.py::collect` |
-| 每轮1出口、失败后轮换 | `order_routes` |
-| 缺票20秒、有效票续采300秒间隔 | `local_ip_harvest.py::retry_interval` 与 `collect` 的 `next_attempt` |
-| 全局3并发、150秒采集预算 | `state-cron.py` 的 ThreadPoolExecutor/deadline |
-| 50分钟开始续票、3570秒视为过期 | Python valid/调度与Go validTicket/ticket；改动需同步 |
-| 每20秒调度、270秒进程上限 | `deploy/state-collector.timer/service` |
-| 账号组切换 | `state-cron.py::sync_groups` |
-
-如果增加一个模型，不能只改 `settings.MODEL`：Go插件对Astra的自动采集分支、前端实际模型校验、SQL中的model mapping、票据key隔离、测试和页面文字都要同步。**模型名和票据长度是两种不同维度**，不要为了让UI变绿而只修改显示判断。
-
-采集器401/403会按当前凭据哈希暂停，429按上游恢复时间等待。不要通过删除cron-state或轮换IP跳过这些暂停。更换合法OAuth凭据后会使用新的独立状态。
-
-## 适配其他Sub2API分支
-
-本仓库没有携带整个主站源码，也没有通用数据库迁移。检查目标分支以下链路：
-
-1. **插件宿主**：管理页/接口能安装、启用v2保护传输插件，清单能力被识别。
-2. **业务转发**：账号代理经 `ForwardRequestStart.proxy_url` 传给插件；当前proto对应 `plugin/pkg/pluginapi/v1/plugin.proto`。若宿主是旧proto，应在宿主统一生成代码，而不是手工修改一个字段编号。
-3. **管理API**：`collector/state-cron.py::call/login`、`monitor/server.py::Handler.do_GET` 中的URL、返回结构和admin角色。
-4. **SQL**：`state-cron.py::run_locked/sync_groups` 和 `local_ip_harvest.py::routes_for`。重点核对 credentials JSON字段、逻辑删除、账号可调度条件和代理过期字段。只读查询取数据，分组写入走管理API。
-5. **目录**：插件固定写 `/app/data/fn-state-reuse`，采集器的 `STATE_TICKET_STORE` 必须是其宿主路径；`incoming`由插件在锁内验证并消费。
-6. **前端登录**：当前前端读取 `auth_token` / `auth_user`，如果宿主变更了存储方式，调整app.js/entry.js；服务端仍必须独立鉴权。
-
-不要把 `plugin/pkg/pluginapi` 的快照覆盖进一个不同版本宿主然后直接上线；先隔离环境测试协议匹配。
-
-## 插件二次开发
-
-`plugin/main.go` 的版本和 `plugin/cmd/pack/main.go` 打包版本必须一致。打包器会检查runtime版本声明，避免宿主以“清单与运行时不一致”拒绝加载。
-
-当前公开版本1.0.12对生产派生版本1.0.11的适配差异：
-
-- 不再把 `proxy_url` 固定为某个生产Docker网关；显式要求提供有效HTTP/HTTPS/SOCKS5/SOCKS5H代理。
-- Python的目录、管理API、容器名、插件ID、分组与UID/GID集中在环境配置。
-- 未配置Clash路由文件时允许只使用IP管理代理。
-- Go业务转发测试使用独立client mock，不会请求真实上游。
-- 去掉历史一次性部署脚本、生产ID列表、备份、二进制与私钥。
-
-修改后执行：
+当前兼容版本由 `plugin/v1_adapter.go` 的 `compatibilityVersion` 返回，打包器清单版本及产物名必须与之相同；`plugin/main.go` 的基础版本也要满足打包器检查。升级始终复用私有发布密钥。
 
 ```bash
 make check test build
+
+npm install --prefix /tmp/state-ui-deps --no-save jsdom@24.1.3
+NODE_PATH=/tmp/state-ui-deps/node_modules make test-ui
 ```
 
-Go测试包括292/332校验、候选导入持久化、过期与凭据隔离、完整流末尾失败、并发长正文、代理认证和普通转发。Python测试包括限流停止、认证暂停、轮换边界、复验失败不入库、候选文件权限、日志白名单及管理员权限。
+测试覆盖模型和凭据隔离、候选导入、请求正文保留、代理认证、限流、账号停调后继续采集、自动入队顺序、插件停用时不写账号、监控权限及模型筛选。测试使用模拟凭据，不使用生产账号发请求。
 
-## 前端展示
+扩展事件字段时同步 `local_ip_harvest.py::emit` 与 `monitor/server.py::FIELDS` 白名单；不得返回原始票据、凭据哈希、请求头或代理 URL。界面使用 `textContent` 渲染服务端文本，保持鉴权失效后的私有内容清理。
 
-默认通过nginx额外路由托管只读页面，再以同源JS添加管理员入口。没有重建宿主Vue应用。
+## Git 开发流程
 
-要做成原生侧栏：在宿主router增加管理员路由，新增页面组件，将 `monitor/app.js` 的 `/fn-state/api` 请求和展示逻辑移入组件；沿用宿主auth store与会话刷新。侧栏条目按admin角色显示，数据API仍逐次验证角色。移除可选nginx-entry注入以免重复入口。
+从自己的 Fork 分支创建功能分支，完成测试后推送至自己的 `origin`。原作者远程建议命名为 `upstream`：
 
-事件与状态字段：
+```bash
+git switch local/sub2api-v1
+git switch -c feature/my-change
+# 修改、检查、提交
+git push -u origin feature/my-change
+```
 
-- `attempt_started` / `attempt_finished`：单次请求，`phase=capture|verify`。
-- `candidate_queued`：携票复验通过并写incoming，尚不等于插件已消费。
-- `account_finished`：`renewed=true`才表示本轮已从持久化存储核验到新票据。
-- `paused`：冷却或认证暂停。
-- `cron-status.json`：一轮结束后的快照；进行中的尝试通过事件流每3秒更新。
-
-扩展日志字段时，要同步采集器 `emit` 白名单和监控 `FIELDS`。不能直接返回原始响应、请求header、代理URL、完整配置或ticket value。
+同步上游应另建分支合并、检查 v1 适配冲突并验证；不要直接在运行目录中拉取并让未验证脚本被 timer 执行。生产切换过程见 [OPERATIONS.md](OPERATIONS.md)。
