@@ -7,7 +7,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-const compatibilityVersion = version + "+sub2api.v1.3"
+const compatibilityVersion = version + "+sub2api.v1.5"
 const v1Capability = "openai.oauth.outbound_transport.v1"
 
 // v1Adapter keeps the plugin's ticket implementation independent of the

@@ -2,7 +2,7 @@
 
 本分支基于 [little-greenbean/sub2api-state-reuse](https://github.com/little-greenbean/sub2api-state-reuse)，将 STATE 插件适配到原作者 [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api) 的 v1 插件宿主，并提供可独立部署的自动化脚本与管理员监控页。
 
-当前插件版本：`1.0.12+sub2api.v1.3`，已在 Sub2API `0.2.7` 上验证。原项目面向另一分支的 v2 宿主；两种插件协议不能混装。本仓库保留上游 SDK、来源声明和 LGPL-3.0 许可证。
+当前插件版本：`1.0.14+sub2api.v1.5`，已在 Sub2API `0.2.7` 上验证。原项目面向另一分支的 v2 宿主；两种插件协议不能混装。本仓库保留上游 SDK、来源声明和 LGPL-3.0 许可证。
 
 **插件和全部自动化脚本位于 [`local/sub2api-v1`](https://github.com/baixuejie/sub2api-state-reuse/tree/local/sub2api-v1) 分支。** `main` 保留原作者代码；请先切换分支再下载或开发：
 
@@ -17,10 +17,13 @@ cd sub2api-state-reuse
 
 - **Astra / Sol 独立采集**：分别探测 `gpt-6-astra` 和 `gpt-5.6-sol`，按账号、模型与当前凭据隔离票据；不跨模型替换 `X-Codex-Turn-State`。
 - **完整验证**：292 / 332 票据需通过结构、时间、实际响应模型与完整流校验，再携票复验后交给插件入库。长度和 HTTP 200 本身不代表成功，也不保证后续模型能力。
+- **票据捆绑与 240 秒生命周期**：上游将 STATE 与会话 Cookie 配对，捆绑约 240 秒后失效。采集时同时捕获响应 `Set-Cookie`，携票复验与业务注入都回放该 Cookie；有效票超过 150 秒即按 30 秒节奏滚动续采，保证在用捆绑始终新鲜。
 - **自动入队**：每 5 秒发现新的 OpenAI OAuth 实体账号，先关闭业务调度，再加入采集名单。排除影子账号、已删除账号和 synthetic UI 测试账号。
 - **有票才调度**：默认只要求 Astra 有效；Sol 缺票不会单独让账号停调。无票账号继续后台采集，票据距过期不足 30 秒时提前停调。
 - **插件开关联动**：插件启用时才执行入队、采集和调度同步。停用时只检查开关，保留原账号状态；重新启用后恢复并补录新账号。
 - **定时采集**：每 20 秒检查；缺票账号每模型每轮尝试一个出口，同一账号的模型依次处理，全局最多 3 个账号并发。认证暂停与配额冷却跨模型共享。
+- **429 防护**：范围内账号业务并发上限为 2，覆盖整个流式响应；429 保留票据并至少退避 5 分钟（尊重更长的 `Retry-After`），401/403 仅撤销请求实际使用的当前票据，旧响应不能误删新票。退避保存在单个插件进程内，重启不持久化。
+- **动态轮换代理**：可选配置 HTTP 代理生成器，缺票时与 Clash、IP 管理出口交替尝试；每次选中动态出口都重新调用生成器获取新 IP。
 - **管理员日志页**：一行一个账号，Astra / Sol 双列状态、有效期、最近结果、账号搜索和模型筛选，每 3 秒刷新。数据接口每次向宿主校验管理员身份。
 
 ## 目录
@@ -46,7 +49,7 @@ cd sub2api-state-reuse
 make check test build
 ```
 
-生成 `plugin/state-reuse-1.0.12+sub2api.v1.3.s2plugin`。首次打包会生成本地 `publisher.key` 与 `publisher.pub`；两者均不提交到仓库。升级时保留并复用私钥，避免发布身份变化。
+生成 `plugin/state-reuse-1.0.14+sub2api.v1.5.s2plugin`。首次打包会生成本地 `publisher.key` 与 `publisher.pub`；两者均不提交到仓库。升级时保留并复用私钥，避免发布身份变化。
 
 在宿主配置中，将生成的公钥加入 `plugins.trusted_publishers`，键名对应安装包签名中的 `key_id`。当前打包器使用 `local-flownode-state-reuse-20260919`；生产环境继续保持 `plugins.allow_unsigned=false`。重启宿主加载公钥后，通过管理员插件页面上传安装包。
 
@@ -72,7 +75,18 @@ sudo install -m 600 deploy/admin.env.example /etc/sub2api-state-reuse/admin.env
 | `STATE_TICKET_STORE` | 与插件 `/app/data/fn-state-reuse/tickets.json` 对应的宿主挂载路径 |
 | `STATE_PLUGIN_UID` / `STATE_PLUGIN_GID` | 插件进程的实际 UID/GID，供候选文件设置权限 |
 | `STATE_ROOT` | 私有采集游标、脱敏事件和状态快照目录 |
+| `STATE_DYNAMIC_PROXY_GENERATORS_FILE` | 可选；动态 HTTP 代理生成器的私有 JSON 配置文件，`0600` |
 | `ADMIN_API_KEY` | 在宿主后台生成的管理 API Key，仅填入私有 `admin.env` |
+
+可选的动态 HTTP 代理生成器文件使用以下格式，并应设为 `0600`。`url` 必须返回一行 `IP:PORT`；采集器每次最多读取 4 KiB，只接受合法 IP 和端口。接口失败时会跳过并继续使用 Clash/IP 管理出口。真实生成器 URL 通常包含鉴权信息，不要提交到 Git：
+
+```json
+[
+  {"name": "rotating-provider", "url": "https://provider.example/generate"}
+]
+```
+
+缺票时动态出口与静态出口交替尝试；每次选中动态出口都会重新调用生成器，因此连续两次动态尝试可能得到不同 IP。
 
 v1 分支的推荐设置：
 
@@ -127,4 +141,4 @@ NODE_PATH=/tmp/state-ui-deps/node_modules make test-ui
 
 `origin` 指向本 Fork，`upstream` 指向原作者；`main` 保留上游版本，本定制开发分支为 `local/sub2api-v1`。后续同步应在独立开发分支中合并上游、解决协议适配冲突并运行测试，再更新运行中的部署。
 
-本分支从上游 `e846350` 保留的可验证基线整理而来，不自动包含上游 `1950029` 的后续变更；上游更新仍可通过 `main` / `upstream` 获取。详细背景与运维边界见 [适配指南](docs/CUSTOMIZATION.md)、[运维说明](docs/OPERATIONS.md) 和 [NOTICE](NOTICE)。
+本分支从上游 `e846350` 保留的可验证基线整理而来，并已将上游 `1950029` 的 429 防护与动态轮换代理移植到 v1 宿主；240 秒票据生命周期与 Cookie 捆绑策略参考了 [446599/ccodex-rotate](https://github.com/446599/ccodex-rotate) 的实测实现。上游后续更新仍可通过 `main` / `upstream` 获取。详细背景与运维边界见 [适配指南](docs/CUSTOMIZATION.md)、[运维说明](docs/OPERATIONS.md) 和 [NOTICE](NOTICE)。

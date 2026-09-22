@@ -1,5 +1,7 @@
 import os, datetime
+import ipaddress
 import json, time, subprocess, tempfile, pathlib, urllib.parse
+import urllib.request
 import ticket_store as mh
 import settings
 from automation import AutomationStopped
@@ -71,7 +73,18 @@ def run_curl(args, cfg, should_run=None):
             raise
 
 
-def request(a, r, ticket=None, should_run=None, model=MODEL):
+def local_cookies(hs):
+    # Keep only name=value pairs from dumped response headers; cookie
+    # attributes (Path, HttpOnly, ...) stay local to the exit that set them.
+    cookies = [
+        l.split(":", 1)[1].strip().split(";")[0]
+        for l in hs.splitlines()
+        if l.lower().startswith("set-cookie:")
+    ]
+    return [c for c in cookies if c]
+
+
+def request(a, r, ticket=None, cookies=None, should_run=None, model=MODEL):
     if model not in settings.MODELS:
         raise ValueError("unsupported probe model")
     out = {"source": r["name"], "phase": "verify" if ticket else "capture", "model": model}
@@ -101,6 +114,10 @@ def request(a, r, ticket=None, should_run=None, model=MODEL):
     }
     if ticket:
         headers["X-Codex-Turn-State"] = ticket
+    # Upstream pairs each issued state with session cookies; replay them
+    # whenever the bundled state is sent again.
+    if cookies:
+        headers["Cookie"] = "; ".join(cookies)
 
     def q(v):
         return (
@@ -221,7 +238,43 @@ def request(a, r, ticket=None, should_run=None, model=MODEL):
                     )
                     out["cooldown"] = 3600
         out["completed"] = complete and not failed and p.returncode == 0
-        return out, value
+        return out, value, local_cookies(hs)
+
+
+def dynamic_routes():
+    if not settings.DYNAMIC_PROXY_GENERATORS_FILE.exists():
+        return []
+    try:
+        generators = json.loads(settings.DYNAMIC_PROXY_GENERATORS_FILE.read_text())
+    except (OSError, ValueError):
+        return []
+    routes = []
+    for index, generator in enumerate(generators):
+        try:
+            with urllib.request.urlopen(generator["url"], timeout=10) as response:
+                raw = response.read(4097)
+            if len(raw) > 4096:
+                continue
+            endpoint = next(
+                (line.strip() for line in raw.decode().splitlines() if line.strip()),
+                "",
+            )
+            host, port_text = endpoint.rsplit(":", 1)
+            ipaddress.ip_address(host)
+            port = int(port_text)
+            if not 1 <= port <= 65535:
+                continue
+            name = str(generator.get("name") or f"generator-{index + 1}")
+            routes.append(
+                {
+                    "key": "generator:" + name,
+                    "name": "动态IP/" + name,
+                    "url": "http://" + endpoint,
+                }
+            )
+        except (OSError, ValueError, KeyError, UnicodeError):
+            continue
+    return routes
 
 
 def routes_for(m):
@@ -270,7 +323,7 @@ def routes_for(m):
             merged.append(routes[i])
         if i < len(ip):
             merged.append(ip[i])
-    return merged
+    return dynamic_routes() + merged
 
 
 def order_routes(routes, st):
@@ -281,6 +334,9 @@ def order_routes(routes, st):
     preferred = next((r for r in routes if r["key"] == st.get("preferred")), None)
     if preferred:
         ordered = [preferred] + [r for r in ordered if r != preferred]
+    dynamic = next((r for r in routes if r["key"].startswith("generator:")), None)
+    if dynamic and not preferred and dynamic["key"] != st.get("last_route"):
+        ordered = [dynamic] + [r for r in ordered if r != dynamic]
     # Never pin a failed account to the same preferred route.
     if len(routes) > 1:
         ordered = [r for r in ordered if r["key"] != st.get("last_route")]
@@ -288,7 +344,9 @@ def order_routes(routes, st):
 
 
 def retry_interval(status):
-    return 20 if status == "missing" else 300
+    # Valid bundles expire in minutes; refresh on the tight cadence, hunt for
+    # missing ones on the collection cadence.
+    return 20 if status == "missing" else settings.TICKET_REFRESH_INTERVAL_SECONDS
 
 
 def account_key(a):
@@ -354,12 +412,13 @@ def collect(a, routes, state, store, deadline, interval=20, should_run=None, mod
             st.pop("preferred", None)
         emit(a["id"], "attempt_started", source=route["name"], phase="capture", model=model)
         try:
-            r, value = request(a, route, should_run=should_run, model=model)
+            r, value, cookies = request(a, route, should_run=should_run, model=model)
         except AutomationStopped:
             return dict(out, automation_stopped=True)
         except Exception as e:
             r = {"source": route["name"], "error": type(e).__name__, "model": model}
             value = ""
+            cookies = []
         out["probes"].append(r)
         emit(a["id"], "attempt_finished", **r)
         if r.get("stop"):
@@ -370,14 +429,14 @@ def collect(a, routes, state, store, deadline, interval=20, should_run=None, mod
             state.setdefault("_account_backoff", {})[account_key(a)] = {
                 "auth_block": st["auth_block"], "next_attempt": st["next_attempt"]}
             break
-        t = mh.candidate(a, value, model=model)
+        t = mh.candidate(a, value, cookies=cookies, model=model)
         if not (t and r.get("completed") and r.get("actual_model") == model):
             continue
         if should_run is not None and not should_run():
             return dict(out, automation_stopped=True)
         emit(a["id"], "attempt_started", source=route["name"], phase="verify", model=model)
         try:
-            v, _ = request(a, route, value, should_run=should_run, model=model)
+            v, _, _ = request(a, route, value, cookies=cookies, should_run=should_run, model=model)
         except AutomationStopped:
             return dict(out, automation_stopped=True)
         except Exception as e:

@@ -20,15 +20,26 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const pluginID = "local.flownode.state-reuse"
-const version = "1.0.12"
+const version = "1.0.14"
 const stateHeader = "X-Codex-Turn-State"
 const dataDir = "/app/data/fn-state-reuse"
+const businessConcurrencyPerAccount = 2
+
+// Upstream honors a harvested STATE bundle (ticket value plus the cookies
+// captured alongside it) for roughly ticketTTLSeconds; requests carrying an
+// older bundle are routed as if no ticket was sent.
+const ticketTTLSeconds = 240
+// Stop reusing a bundle slightly before upstream expiry so a request never
+// starts on a ticket that dies mid-flight. Mirrors the collector's scheduling
+// margin.
+const ticketReuseMarginSeconds = 30
 
 type Config struct {
 	ProxyURL        string  `json:"proxy_url"`
@@ -37,11 +48,12 @@ type Config struct {
 	Suspended       []int64 `json:"suspended"`
 }
 type Ticket struct {
-	AccountID      int64  `json:"account_id"`
-	Model          string `json:"model"`
-	CredentialHash string `json:"credential_hash"`
-	Value          string `json:"value"`
-	Issued         int64  `json:"issued"`
+	AccountID      int64    `json:"account_id"`
+	Model          string   `json:"model"`
+	CredentialHash string   `json:"credential_hash"`
+	Value          string   `json:"value"`
+	Issued         int64    `json:"issued"`
+	Cookies        []string `json:"cookies,omitempty"`
 }
 type Entry struct {
 	mu       sync.Mutex
@@ -55,6 +67,8 @@ type Plugin struct {
 	entries               map[string]*Entry
 	client                *http.Client
 	businessClientFactory func(string) (*http.Client, error)
+	businessSlots         map[int64]chan struct{}
+	businessBackoff       map[int64]time.Time
 	store                 string
 	slots                 chan struct{}
 	reused                int
@@ -63,7 +77,7 @@ type Plugin struct {
 }
 
 func NewPlugin(store string) *Plugin {
-	return &Plugin{entries: map[string]*Entry{}, store: store, slots: make(chan struct{}, 3)}
+	return &Plugin{entries: map[string]*Entry{}, businessSlots: map[int64]chan struct{}{}, businessBackoff: map[int64]time.Time{}, store: store, slots: make(chan struct{}, 3)}
 }
 func capability() v2.Capability {
 	return v2.Capability{ID: v2.CapabilityProtectionTransport, Kind: v2.CapabilityKindProvider, Platform: "openai", AccountType: "oauth", Permissions: []v2.Permission{v2.PermissionRequestMetadata, v2.PermissionRequestBody, v2.PermissionCredentialsForward, v2.PermissionNetworkOutbound, v2.PermissionAccountProtection, v2.PermissionOriginalRequest}, TimeoutMS: 120000, FailureMode: v2.FailureModeClosed, Synchronous: true}
@@ -214,7 +228,7 @@ func parseState(value string) (int64, bool) {
 }
 func validTicket(t Ticket, now time.Time) bool {
 	i, ok := parseState(t.Value)
-	return ok && i == t.Issued && i <= now.Unix()+30 && now.Unix() < i+3570 && t.AccountID > 0 && t.Model != "" && len(t.CredentialHash) == 64
+	return ok && i == t.Issued && i <= now.Unix()+30 && now.Unix() < i+ticketTTLSeconds && t.AccountID > 0 && t.Model != "" && len(t.CredentialHash) == 64
 }
 func contains(ids []int64, id int64) bool {
 	for _, v := range ids {
@@ -297,6 +311,22 @@ func (p *Plugin) businessClient(proxyURL string) (*http.Client, error) {
 	return &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, nil
 }
 
+func (p *Plugin) acquireBusiness(ctx context.Context, accountID int64) (func(), error) {
+	p.mu.Lock()
+	slot := p.businessSlots[accountID]
+	if slot == nil {
+		slot = make(chan struct{}, businessConcurrencyPerAccount)
+		p.businessSlots[accountID] = slot
+	}
+	p.mu.Unlock()
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (p *Plugin) ticket(ctx context.Context, id int64, model string, headers http.Header) (Ticket, error) {
 	hash := identity(headers)
 	k := key(id, model, hash)
@@ -332,7 +362,7 @@ func (p *Plugin) ticket(ctx context.Context, id int64, model string, headers htt
 	if entry.blocked {
 		return Ticket{}, errors.New("credential denied; wait for new authentication")
 	}
-	if validTicket(entry.ticket, now) && now.Unix() < entry.ticket.Issued+3000 {
+	if validTicket(entry.ticket, now) && now.Unix() < entry.ticket.Issued+ticketTTLSeconds-ticketReuseMarginSeconds {
 		return entry.ticket, nil
 	}
 	if now.Before(entry.cooldown) {
@@ -398,6 +428,14 @@ func harvest(ctx context.Context, client *http.Client, id int64, model string, h
 	if resp.StatusCode != 200 {
 		return Ticket{}, terminal, fmt.Errorf("harvest HTTP %d", resp.StatusCode)
 	}
+	// Capture the session cookies issued alongside the state; a request that
+	// replays this state must carry them while the bundle is fresh.
+	var cookies []string
+	for _, c := range resp.Cookies() {
+		if c.Name != "" && c.Value != "" {
+			cookies = append(cookies, c.Name+"="+c.Value)
+		}
+	}
 	state := resp.Header.Get(stateHeader)
 	issued, shape := parseState(state)
 	completed := false
@@ -445,7 +483,7 @@ func harvest(ctx context.Context, client *http.Client, id int64, model string, h
 			}
 		}
 	}
-	t := Ticket{id, model, identity(h), state, issued}
+	t := Ticket{AccountID: id, Model: model, CredentialHash: identity(h), Value: state, Issued: issued, Cookies: cookies}
 	if scan.Err() != nil || !completed || failed || !match || !shape || !validTicket(t, time.Now()) {
 		if limited {
 			return Ticket{}, terminal, errors.New("harvest usage_limit or rate_limit")
@@ -505,6 +543,27 @@ func (p *Plugin) Forward(stream grpc.BidiStreamingServer[v1.ForwardRequest, v1.F
 	enabled := contains(p.config.Accounts, start.AccountId)
 	client := p.client
 	p.mu.Unlock()
+	// In-scope accounts get a per-account business concurrency cap and 429 backoff.
+	// Out-of-scope traffic keeps passing through untouched.
+	var releaseBusiness func()
+	if enabled {
+		var waitErr error
+		releaseBusiness, waitErr = p.acquireBusiness(stream.Context(), start.AccountId)
+		if waitErr != nil {
+			return fail("account_concurrency_wait_canceled", false)
+		}
+		defer releaseBusiness()
+		p.mu.Lock()
+		until := p.businessBackoff[start.AccountId]
+		p.mu.Unlock()
+		if time.Now().Before(until) {
+			seconds := int(time.Until(until).Seconds()) + 1
+			if err := stream.Send(&v1.ForwardResponse{Frame: &v1.ForwardResponse_Start{Start: &v1.ForwardResponseStart{StatusCode: 429, Status: "429 Too Many Requests", Protocol: "HTTP/1.1", ProtocolMajor: 1, ProtocolMinor: 1, Headers: map[string]*v1.HeaderValues{"Retry-After": {Values: []string{strconv.Itoa(seconds)}}}}}}); err != nil {
+				return err
+			}
+			return stream.Send(&v1.ForwardResponse{Frame: &v1.ForwardResponse_End{End: &v1.ForwardResponseEnd{}}})
+		}
+	}
 	var t Ticket
 	// The v1 host routes all OAuth transport through one plugin. Only selected
 	// Codex requests may use tickets; other requests retain their original body
@@ -549,10 +608,15 @@ func (p *Plugin) Forward(stream grpc.BidiStreamingServer[v1.ForwardRequest, v1.F
 		}
 		if protected {
 			req.Header.Set(stateHeader, t.Value)
+			// Replay the session cookies harvested with this state; upstream
+			// ignores a state sent without its pairing cookie.
+			if len(t.Cookies) > 0 {
+				req.Header.Set("Cookie", strings.Join(t.Cookies, "; "))
+			}
 			p.mu.Lock()
 			p.reused++
 			p.mu.Unlock()
-			p.audit("inject", t, "account/model/credential matched")
+			p.audit("inject", t, fmt.Sprintf("account/model/credential matched; cookies=%d", len(t.Cookies)))
 		} else {
 			req.Header.Del(stateHeader)
 			p.audit("unprotected_forward", Ticket{AccountID: start.AccountId, Model: metadata.Model}, "no valid ticket; forward normally")
@@ -573,6 +637,22 @@ func (p *Plugin) Forward(stream grpc.BidiStreamingServer[v1.ForwardRequest, v1.F
 		return fail("upstream_transport_error", true)
 	}
 	defer resp.Body.Close()
+	if enabled && resp.StatusCode == 429 {
+		until := time.Now().Add(5 * time.Minute)
+		if seconds, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && seconds > 0 {
+			candidate := time.Now().Add(time.Duration(seconds) * time.Second)
+			if candidate.After(until) {
+				until = candidate
+			}
+		} else if candidate, err := http.ParseTime(resp.Header.Get("Retry-After")); err == nil && candidate.After(until) {
+			until = candidate
+		}
+		p.mu.Lock()
+		if until.After(p.businessBackoff[start.AccountId]) {
+			p.businessBackoff[start.AccountId] = until
+		}
+		p.mu.Unlock()
+	}
 	hdr := map[string]*v1.HeaderValues{}
 	for k, v := range resp.Header {
 		hdr[k] = &v1.HeaderValues{Values: v}
@@ -587,10 +667,16 @@ func (p *Plugin) Forward(stream grpc.BidiStreamingServer[v1.ForwardRequest, v1.F
 		p.mu.Unlock()
 		if entry != nil {
 			entry.mu.Lock()
-			_ = p.persist(key(t.AccountID, t.Model, t.CredentialHash), Ticket{})
-			entry.ticket = Ticket{}
-			entry.cooldown = time.Now().Add(5 * time.Minute)
-			entry.blocked = resp.StatusCode != 429
+			// 429 keeps the current ticket; only 401/403 revoke it. A stale
+			// response must never clear a ticket imported after the request began.
+			if entry.ticket.Value == t.Value && entry.ticket.Issued == t.Issued {
+				entry.cooldown = time.Now().Add(5 * time.Minute)
+				if resp.StatusCode != 429 {
+					_ = p.persist(key(t.AccountID, t.Model, t.CredentialHash), Ticket{})
+					entry.ticket = Ticket{}
+					entry.blocked = true
+				}
+			}
 			entry.mu.Unlock()
 		}
 	}

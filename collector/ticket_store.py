@@ -6,7 +6,7 @@ import settings
 MODEL = settings.MODEL
 
 
-def candidate(a, value, model=MODEL):
+def candidate(a, value, cookies=None, model=MODEL):
     if model not in settings.MODELS:
         return None
     try:
@@ -15,7 +15,7 @@ def candidate(a, value, model=MODEL):
         if (
             (len(value), len(b)) not in ((292, 217), (332, 249))
             or b[0] != 128
-            or not time.time() - 3000 < issued <= time.time() + 30
+            or not time.time() - settings.TICKET_TTL_SECONDS < issued <= time.time() + 30
         ):
             return None
         return {
@@ -24,6 +24,7 @@ def candidate(a, value, model=MODEL):
             "credential_hash": a["hash"],
             "issued": issued,
             "value": value,
+            "cookies": list(cookies or []),
         }
     except (ValueError, IndexError):
         return None

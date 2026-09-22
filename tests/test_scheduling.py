@@ -38,7 +38,7 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(api.call_args.args[2], {"schedulable": True})
 
     def test_expiry_credential_model_and_account_isolation(self):
-        variants = [self.ticket(self.now - 3541), self.ticket(self.now - 3570)]
+        variants = [self.ticket(self.now - 211), self.ticket(self.now - 241)]
         for key, value in [("credential_hash", "b" * 64), ("model", "other"), ("account_id", 18)]:
             ticket = self.ticket()
             ticket[key] = value

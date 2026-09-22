@@ -14,10 +14,10 @@ function fixture() {
     automation: { enabled: true }, policy: { required_models: [ASTRA] }, tickets: [],
     accounts: [{ account_id: 17, account_name: '<img src=x onerror="alert(1)">', plan: "pro",
       business_schedulable: true, scheduling_reason: "ticket_ready", missing_models: [],
-      models: { [ASTRA]: { status: "fresh", length: 292, issued_at: now-100, expires_at: now+3000 },
+      models: { [ASTRA]: { status: "fresh", length: 292, issued_at: now-100, expires_at: now+140 },
                 [SOL]: { status: "missing", next_attempt: now+20, last_probe: { at: now, http: 200, actual_model: "gpt-5.6-luna", completed: true, length:312 } } } },
       { account_id: 18, account_name: "Team test", business_schedulable: false, scheduling_reason: "waiting_for_ticket", missing_models: [ASTRA],
-        models: { [ASTRA]: { status: "missing" }, [SOL]: { status: "fresh", length:332, expires_at:now+500 } } }],
+        models: { [ASTRA]: { status: "missing" }, [SOL]: { status: "fresh", length:332, expires_at: now+200 } } }],
     events: [{ at:now, account_id:17, event:"attempt_finished", model:SOL, http:200, completed:true, actual_model:SOL, length:292 },
              { at:now, account_id:18, event:"attempt_finished", model:ASTRA, http:200, completed:true, actual_model: "gpt-5.6-luna", length:312 }] };
 }

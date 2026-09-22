@@ -14,8 +14,8 @@ import (
 
 func main() {
 	source, err := os.ReadFile("main.go")
-	if err != nil || !bytes.Contains(source, []byte(`const version = "1.0.12"`)) {
-		panic("runtime version must match package version 1.0.12")
+	if err != nil || !bytes.Contains(source, []byte(`const version = "1.0.14"`)) {
+		panic("runtime version must match package version 1.0.14")
 	}
 	key, e := os.ReadFile("publisher.key")
 	var priv ed25519.PrivateKey
@@ -52,7 +52,7 @@ func main() {
 	}
 	manifest := map[string]any{
 		"schema_version": 1, "id": "local.flownode.state-reuse",
-		"name": "STATE Reuse (Sub2API v1)", "version": "1.0.12+sub2api.v1.3",
+		"name": "STATE Reuse (Sub2API v1)", "version": "1.0.14+sub2api.v1.5",
 		"description": "STATE reuse adapted for the original Sub2API v1 host",
 		"requires": map[string]any{
 			"sub2api": ">=0.2.7 <0.3.0", "recommended_sub2api_version": "0.2.7",
@@ -69,7 +69,7 @@ func main() {
 	sig, _ := json.Marshal(map[string]string{"algorithm": "ed25519", "key_id": "local-flownode-state-reuse-20260919", "public_key": base64.StdEncoding.EncodeToString(pub), "signature": base64.StdEncoding.EncodeToString(ed25519.Sign(priv, m))})
 	files["manifest.json"] = m
 	files["signature.json"] = sig
-	f, e := os.Create("state-reuse-1.0.12+sub2api.v1.3.s2plugin")
+	f, e := os.Create("state-reuse-1.0.14+sub2api.v1.5.s2plugin")
 	if e != nil {
 		panic(e)
 	}

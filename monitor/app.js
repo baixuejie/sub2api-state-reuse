@@ -74,7 +74,7 @@
       expiry.title = "票据有效期与模型能力无直接等价关系";
       td.append(expiry);
       const meter = el("div", undefined, "meter"), bar = el("i");
-      bar.style.width = `${Math.max(0, Math.min(100, (expires - now) / 3570 * 100))}%`;
+      bar.style.width = `${Math.max(0, Math.min(100, (expires - now) / 240 * 100))}%`;
       meter.append(bar); td.append(meter);
     }
     const probe = detail.last_probe;
@@ -82,7 +82,7 @@
       td.append(el("span", `最近：${outcome(probe, model)}`, "sub"));
       td.append(el("span", fmt(probe.at), "sub"));
     }
-    const next = valid ? (detail.issued_at ? detail.issued_at + 3000 : expires - 570) : detail.next_attempt;
+    const next = valid ? (detail.issued_at ? detail.issued_at + 150 : expires - 90) : detail.next_attempt;
     if (!automationPaused && !blocked && detail.status !== "model_not_enabled") {
       td.append(el("span", next > now ? `${valid ? "续采" : "下次尝试"} ${fmt(next)}` : "下一轮检查", "sub"));
     }

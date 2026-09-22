@@ -29,7 +29,7 @@ class CollectorTests(unittest.TestCase):
     def test_denied_credentials_are_not_retried(self):
         state = {}
         with patch.object(
-            harvest, "request", return_value=({"stop": True, "auth_block": True}, "")
+            harvest, "request", return_value=({"stop": True, "auth_block": True}, "", [])
         ) as request:
             harvest.collect(
                 self.account, self.routes, state, None, time.monotonic() + 150
@@ -42,7 +42,7 @@ class CollectorTests(unittest.TestCase):
     def test_rate_limit_does_not_rotate(self):
         state = {}
         with patch.object(
-            harvest, "request", return_value=({"stop": True, "cooldown": 7200}, "")
+            harvest, "request", return_value=({"stop": True, "cooldown": 7200}, "", [])
         ) as request:
             harvest.collect(
                 self.account, self.routes, state, None, time.monotonic() + 150
@@ -57,8 +57,8 @@ class CollectorTests(unittest.TestCase):
             harvest,
             "request",
             side_effect=[
-                ({"completed": True, "actual_model": settings.MODEL}, "test"),
-                ({"completed": False}, ""),
+                ({"completed": True, "actual_model": settings.MODEL}, "test", []),
+                ({"completed": False}, "", []),
             ],
         ), patch.object(
             ticket_store, "candidate", return_value={"value": "test"}
@@ -73,7 +73,7 @@ class CollectorTests(unittest.TestCase):
         with patch.object(
             harvest,
             "request",
-            return_value=({"completed": True, "actual_model": settings.MODEL}, "test"),
+            return_value=({"completed": True, "actual_model": settings.MODEL}, "test", []),
         ), patch.object(
             ticket_store, "candidate", return_value={"value": "test"}
         ), patch.object(ticket_store, "queue_ticket") as queue:
@@ -89,7 +89,7 @@ class CollectorTests(unittest.TestCase):
         with patch.object(
             harvest,
             "request",
-            return_value=({"completed": True, "actual_model": "other-model"}, ""),
+            return_value=({"completed": True, "actual_model": "other-model"}, "", []),
         ) as request:
             harvest.collect(
                 self.account, self.routes, state, None, time.monotonic() + 150
@@ -99,11 +99,13 @@ class CollectorTests(unittest.TestCase):
 
     def test_missing_and_renewal_intervals(self):
         self.assertEqual(harvest.retry_interval("missing"), 20)
-        self.assertEqual(harvest.retry_interval("renew_due"), 300)
+        self.assertEqual(
+            harvest.retry_interval("renew_due"), settings.TICKET_REFRESH_INTERVAL_SECONDS
+        )
 
     def test_failed_preferred_route_rotates_after_twenty_seconds(self):
         state = {"101:" + "a" * 64: {"preferred": "0"}}
-        response = ({"completed": True, "actual_model": "other-model"}, "")
+        response = ({"completed": True, "actual_model": "other-model"}, "", [])
         with patch.object(
             harvest, "request", return_value=response
         ) as request, patch.object(harvest.time, "time", return_value=1000):
@@ -190,9 +192,112 @@ class CollectorTests(unittest.TestCase):
 
         with patch.object(
             settings, "ROUTES_FILE", Path(self.temp.name) / "missing.json"
+        ), patch.object(
+            settings,
+            "DYNAMIC_PROXY_GENERATORS_FILE",
+            Path(self.temp.name) / "missing-generators.json",
         ):
             routes = harvest.routes_for(Fake)
         self.assertEqual(routes[0]["url"], "socks5h://u%40x:p%3Ax@192.0.2.1:1080")
+
+    def test_dynamic_generator_accepts_only_ip_and_port(self):
+        config = Path(self.temp.name) / "generators.json"
+        config.write_text(json.dumps([{"name": "rotating", "url": "https://example"}]))
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            @staticmethod
+            def read(_):
+                return b"192.0.2.10:8080\n"
+
+        with patch.object(
+            settings, "DYNAMIC_PROXY_GENERATORS_FILE", config
+        ), patch.object(harvest.urllib.request, "urlopen", return_value=Response()):
+            routes = harvest.dynamic_routes()
+        self.assertEqual(
+            routes,
+            [
+                {
+                    "key": "generator:rotating",
+                    "name": "动态IP/rotating",
+                    "url": "http://192.0.2.10:8080",
+                }
+            ],
+        )
+
+    def test_dynamic_generator_rejects_non_ip_response(self):
+        config = Path(self.temp.name) / "generators.json"
+        config.write_text(json.dumps([{"url": "https://example"}]))
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            @staticmethod
+            def read(_):
+                return b"proxy.example:8080\n"
+
+        with patch.object(
+            settings, "DYNAMIC_PROXY_GENERATORS_FILE", config
+        ), patch.object(harvest.urllib.request, "urlopen", return_value=Response()):
+            self.assertEqual(harvest.dynamic_routes(), [])
+
+    def test_dynamic_generator_alternates_with_static_routes(self):
+        routes = [
+            {"key": "generator:rotating", "name": "dynamic"},
+            {"key": "clash:1", "name": "static-1"},
+            {"key": "clash:2", "name": "static-2"},
+        ]
+        self.assertEqual(harvest.order_routes(routes, {})[0]["key"], "generator:rotating")
+        state = {"last_route": "generator:rotating", "cursor": 1}
+        self.assertEqual(harvest.order_routes(routes, state)[0]["key"], "clash:1")
+        state = {"last_route": "clash:1", "cursor": 2}
+        self.assertEqual(harvest.order_routes(routes, state)[0]["key"], "generator:rotating")
+
+    def test_captured_cookies_are_replayed_on_verification(self):
+        with patch.object(
+            harvest,
+            "request",
+            side_effect=[
+                ({"completed": True, "actual_model": settings.MODEL}, "test", ["session=abc", "other=xyz"]),
+                ({"completed": True, "actual_model": settings.MODEL}, "test", []),
+            ],
+        ) as request, patch.object(
+            ticket_store, "candidate", return_value={"value": "test", "cookies": ["session=abc", "other=xyz"]}
+        ), patch.object(ticket_store, "queue_ticket") as queue:
+            result = harvest.collect(
+                self.account, self.routes[:1], {}, None, time.monotonic() + 150
+            )
+            self.assertTrue(result["captured"])
+            self.assertEqual(
+                request.call_args_list[1].kwargs.get("cookies"),
+                ["session=abc", "other=xyz"],
+            )
+            queued = queue.call_args.args[1]
+            self.assertEqual(queued["cookies"], ["session=abc", "other=xyz"])
+
+    def test_candidate_keeps_name_value_cookies_only_from_headers(self):
+        raw = b"\x80" + int(time.time()).to_bytes(8, "big") + bytes(240)
+        value = base64.urlsafe_b64encode(raw).decode()
+        cookies = harvest.local_cookies(
+            "HTTP/1.1 200 OK\r\nset-cookie: session=abc; Path=/; HttpOnly\r\n"
+            "SET-COOKIE: other=xyz; Secure\r\nX-Ignore: 1\r\n\r\n"
+        )
+        candidate = ticket_store.candidate(self.account, value, cookies=cookies)
+        self.assertEqual(candidate["cookies"], ["session=abc", "other=xyz"])
+        self.assertIsNone(
+            ticket_store.candidate(
+                self.account, value, cookies=["not from headers"], model="other"
+            )
+        )
 
 
 if __name__ == "__main__":

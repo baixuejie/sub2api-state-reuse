@@ -21,7 +21,7 @@ def decision(account, tickets, plugin_ready, harvest_state, now):
             if ticket.get("account_id") == account["id"] and ticket.get("model") == model
             and cron.valid(ticket, account, now)]
         newest = max(candidates, key=lambda ticket: ticket["issued"]) if candidates else None
-        expires = newest["issued"] + 3570 if newest else None
+        expires = newest["issued"] + cron.settings.TICKET_TTL_SECONDS if newest else None
         per_model[model] = {"ticket_ready": expires is not None and expires > now + cron.settings.SCHEDULING_MARGIN,
                             "ticket_expires_at": expires}
     missing = [model for model in cron.settings.REQUIRED_MODELS if not per_model[model]["ticket_ready"]]

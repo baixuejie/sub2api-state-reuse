@@ -120,7 +120,7 @@ def valid(t, a, now):
             and b[0] == 128
             and issued == t["issued"]
             and issued <= now + 30
-            and now < issued + 3570
+            and now < issued + settings.TICKET_TTL_SECONDS
             and t["credential_hash"] == a["hash"]
         )
     except (ValueError, KeyError, TypeError):
@@ -179,7 +179,7 @@ def model_summary(account, model, tickets, state, now):
     candidates = [t for t in tickets if t.get("account_id") == account["id"]
                   and t.get("model") == model and valid(t, account, now)]
     newest = max(candidates, key=lambda t: t["issued"]) if candidates else None
-    status = "fresh" if newest and now < newest["issued"] + 3000 else "renew_due" if newest else "missing"
+    status = "fresh" if newest and now < newest["issued"] + settings.TICKET_REFRESH_AFTER_SECONDS else "renew_due" if newest else "missing"
     shared = local_ip_harvest.shared_pause(state.get("local_ip_harvest", {}), account)
     model_state = state.get("local_ip_harvest", {}).get(local_ip_harvest.model_key(account, model), {})
     auth_block = bool(shared.get("auth_block") or model_state.get("auth_block"))
@@ -190,7 +190,7 @@ def model_summary(account, model, tickets, state, now):
     last = state.get("last_results", {}).get(f"{account['id']}:{model}")
     return {"account_id": account["id"], "account_name": account.get("name", ""),
         "plan": account.get("plan"), "model": model, "status": status,
-        "expires_at": newest["issued"] + 3570 if newest else None,
+        "expires_at": newest["issued"] + settings.TICKET_TTL_SECONDS if newest else None,
         "issued_at": newest["issued"] if newest else None,
         "length": len(newest["value"]) if newest else None,
         "next_attempt": max(state["attempts"].get(f"{account['id']}:{model}", 0)
@@ -412,7 +412,7 @@ def run_locked():
                     "model": t["model"],
                     "length": len(t["value"]),
                     "issued_at": t["issued"],
-                    "expires_at": t["issued"] + 3570,
+                    "expires_at": t["issued"] + settings.TICKET_TTL_SECONDS,
                 }
             )
     summary = [model_summary(account, model, final, state, time.time())
