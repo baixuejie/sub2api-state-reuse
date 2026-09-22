@@ -78,6 +78,9 @@
       meter.append(bar); td.append(meter);
     }
     const probe = detail.last_probe;
+    const stats = detail.egress || {};
+    td.append(el("span", `累计尝试 ${stats.attempts || 0} 次 · 已确认换 IP ${stats.ip_changes || 0} 次`, "sub"));
+    if (stats.last_confirmed_ip) td.append(el("span", `最近确认出口：${stats.last_confirmed_ip}`, "sub"));
     if (probe) {
       td.append(el("span", `最近：${outcome(probe, model)}`, "sub"));
       td.append(el("span", fmt(probe.at), "sub"));
@@ -143,12 +146,16 @@
       cell(row, fmt(event.at)); cell(row, `#${event.account_id}`);
       cell(row, names[event.model] || event.model || "账号", event.model === SOL ? "attention" : "");
       cell(row, (stages[event.event] || event.event) + (event.phase === "verify" ? " · 携票复验" : ""));
-      cell(row, event.source || "—");
+      const exit = cell(row, event.egress_status === "confirmed" && event.egress_ip ? event.egress_ip : "未确认");
+      exit.append(el("span", event.source || "—", "sub"));
+      if (event.egress_status === "connection_changed") exit.append(el("span", "连接已变化，无法归属本次请求", "sub"));
+      const attempts = cell(row, event.attempt_no ? `第 ${event.attempt_no} 次尝试` : "—");
+      if (event.ip_changes !== undefined) attempts.append(el("span", `已确认换 IP ${event.ip_changes} 次${event.ip_changed ? " · 本次已变化" : ""}`, "sub"));
       cell(row, outcome(event), "badge " + (passed(event) ? "good" : failed(event) ? "warn" : ""));
       cell(row, [event.length ? `${event.length} 字符` : "", event.actual_model].filter(Boolean).join(" / ") || "—");
       $("events").append(row);
     }
-    if (!events.length) emptyRow($("events"), 7, "暂无匹配事件。可切换模型、账号或结果筛选。");
+    if (!events.length) emptyRow($("events"), 8, "暂无匹配事件。可切换模型、账号或结果筛选。");
     $("updated").textContent = `页面更新 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })} · 服务端 ${fmt(now)} · ${events.length} 条事件`;
     const age = data.updated_at ? now - Date.parse(data.updated_at) / 1000 : Infinity;
     const unavailable = data.automation?.plugin_state === "unavailable";

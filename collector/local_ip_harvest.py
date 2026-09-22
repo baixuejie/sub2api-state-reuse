@@ -4,6 +4,7 @@ import json, time, subprocess, tempfile, pathlib, urllib.parse
 import urllib.request
 import ticket_store as mh
 import settings
+import egress
 from automation import AutomationStopped
 
 MODEL = settings.MODEL
@@ -36,7 +37,7 @@ def emit(account_id, event, **fields):
         "account_id": account_id,
         "event": event,
     }
-    row.update({k: v for k, v in fields.items() if k in allowed})
+    row.update({k: v for k, v in fields.items() if k in allowed + egress.FIELDS})
     line = json.dumps(row, ensure_ascii=False) + "\n"
     EVENTS.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(EVENTS, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -49,12 +50,12 @@ def emit(account_id, event, **fields):
 
 def run_curl(args, cfg, should_run=None):
     if should_run is None:
-        return subprocess.run(args, input=cfg, text=True, capture_output=True, timeout=35)
+        return subprocess.run(args, input=cfg, text=True, capture_output=True, timeout=40)
     if not should_run():
         raise AutomationStopped()
     with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, text=True) as process:
-        deadline = time.monotonic() + 35
+        deadline = time.monotonic() + 40
         first = True
         try:
             while True:
@@ -132,6 +133,7 @@ def request(a, r, ticket=None, cookies=None, should_run=None, model=MODEL):
     with tempfile.TemporaryDirectory(prefix="state-task-") as d:
         h = pathlib.Path(d) / "headers"
         b = pathlib.Path(d) / "body"
+        trace = pathlib.Path(d) / "trace"
         cfg = "\n".join(
             [
                 'url = "https://chatgpt.com/backend-api/codex/responses"',
@@ -141,9 +143,20 @@ def request(a, r, ticket=None, cookies=None, should_run=None, model=MODEL):
                 "data = " + q(json.dumps(body)),
                 "dump-header = " + q(str(h)),
                 "output = " + q(str(b)),
+                "http1.1",
+                'max-time = "30"',
+                'connect-timeout = "10"',
+                "write-out = " + q('{"transfer":"upstream","exitcode":%{exitcode}}\n'),
             ]
             + ["header = " + q(k + ": " + v) for k, v in headers.items()]
         )
+        cfg += "\nnext\n" + "\n".join([
+            'url = "https://chatgpt.com/cdn-cgi/trace"',
+            "proxy = " + q(r["url"]), 'noproxy = ""', "http1.1",
+            'max-time = "5"', 'connect-timeout = "3"', 'max-filesize = "4096"',
+            "output = " + q(str(trace)),
+            "write-out = " + q('{"transfer":"trace","exitcode":%{exitcode},"http_code":%{http_code},"num_connects":%{num_connects}}\n'),
+        ])
         p = run_curl(
             [
                 "curl",
@@ -161,6 +174,9 @@ def request(a, r, ticket=None, cookies=None, should_run=None, model=MODEL):
         )
         hs = h.read_text() if h.exists() else ""
         bs = b.read_text(errors="replace") if b.exists() else ""
+        transfers = egress.transfer_results(p.stdout)
+        request_code = transfers.get("upstream", {}).get("exitcode", p.returncode)
+        out.update(egress.observation(transfers, trace.read_text(errors="replace") if trace.exists() else ""))
         codes = [int(l.split()[1]) for l in hs.splitlines() if l.startswith("HTTP/")]
         code = codes[-1] if codes else 0
         out["http"] = code
@@ -173,8 +189,8 @@ def request(a, r, ticket=None, cookies=None, should_run=None, model=MODEL):
             "",
         )
         out["length"] = len(value)
-        if p.returncode:
-            out["transport_error"] = p.returncode
+        if request_code:
+            out["transport_error"] = request_code
         if code in (401, 403, 429):
             out["stop"] = True
             out["auth_block"] = code in (401, 403)
@@ -237,8 +253,30 @@ def request(a, r, ticket=None, cookies=None, should_run=None, model=MODEL):
                         "account_deactivated",
                     )
                     out["cooldown"] = 3600
-        out["completed"] = complete and not failed and p.returncode == 0
-        return out, value, local_cookies(hs)
+        out["completed"] = complete and not failed and request_code == 0
+    return out, value, local_cookies(hs)
+
+
+def resolve_route(route):
+    """Resolve a configured generator once per capture; reuse it for verification."""
+    if not route.get("generator_url"):
+        return route
+    endpoint = urllib.parse.urlsplit(route["generator_url"])
+    if endpoint.scheme not in ("http", "https") or not endpoint.hostname or endpoint.username or endpoint.fragment:
+        raise ValueError("invalid generator URL")
+    with urllib.request.urlopen(route["generator_url"], timeout=10) as response:
+        if response.status != 200:
+            raise ValueError("generator HTTP error")
+        raw = response.read(4097)
+    if len(raw) > 4096:
+        raise ValueError("oversized generator response")
+    line = next((line.strip() for line in raw.decode().splitlines() if line.strip()), "")
+    host, port = line.rsplit(":", 1)
+    address = ipaddress.ip_address(host.strip("[]"))
+    if not 1 <= int(port) <= 65535:
+        raise ValueError("invalid generator port")
+    host = f"[{address}]" if address.version == 6 else str(address)
+    return dict(route, url=f"http://{host}:{int(port)}")
 
 
 def dynamic_routes():
@@ -375,6 +413,7 @@ def collect(a, routes, state, store, deadline, interval=20, should_run=None, mod
         state.setdefault("_account_backoff", {})[account_key(a)] = shared_pause(state, a)
         legacy["retry_scoped"] = True
     st = state.setdefault(model_key(a, model), {})
+    stats = egress.counters(state, a["id"], model)
     st["retry_scoped"] = True
     shared = shared_pause(state, a)
     out = {
@@ -403,22 +442,26 @@ def collect(a, routes, state, store, deadline, interval=20, should_run=None, mod
     for route in order_routes(routes, st):
         if should_run is not None and not should_run():
             return dict(out, automation_stopped=True)
-        if time.monotonic() + 65 > deadline:
+        if time.monotonic() + 85 > deadline:
             break
         st["cursor"] = (routes.index(route) + 1) % len(routes)
         st["last_route"] = route["key"]
         # Restore preference only after a new capture and carry-ticket verification.
         if st.get("preferred") == route["key"]:
             st.pop("preferred", None)
-        emit(a["id"], "attempt_started", source=route["name"], phase="capture", model=model)
+        stats["attempts"] += 1
+        emit(a["id"], "attempt_started", source=route["name"], phase="capture", model=model,
+             attempt_no=stats["attempts"], request_no=stats["requests"]+1, ip_changes=stats["ip_changes"])
         try:
+            route = resolve_route(route)
             r, value, cookies = request(a, route, should_run=should_run, model=model)
         except AutomationStopped:
             return dict(out, automation_stopped=True)
         except Exception as e:
-            r = {"source": route["name"], "error": type(e).__name__, "model": model}
+            r = {"source": route["name"], "error": type(e).__name__, "model": model, "phase": "capture"}
             value = ""
             cookies = []
+        egress.record(stats, r)
         out["probes"].append(r)
         emit(a["id"], "attempt_finished", **r)
         if r.get("stop"):
@@ -434,13 +477,15 @@ def collect(a, routes, state, store, deadline, interval=20, should_run=None, mod
             continue
         if should_run is not None and not should_run():
             return dict(out, automation_stopped=True)
-        emit(a["id"], "attempt_started", source=route["name"], phase="verify", model=model)
+        emit(a["id"], "attempt_started", source=route["name"], phase="verify", model=model,
+             attempt_no=stats["attempts"], request_no=stats["requests"]+1, ip_changes=stats["ip_changes"])
         try:
             v, _, _ = request(a, route, value, cookies=cookies, should_run=should_run, model=model)
         except AutomationStopped:
             return dict(out, automation_stopped=True)
         except Exception as e:
-            v = {"source": route["name"], "error": type(e).__name__, "model": model}
+            v = {"source": route["name"], "error": type(e).__name__, "model": model, "phase": "verify"}
+        egress.record(stats, v)
         out["probes"].append(v)
         emit(a["id"], "attempt_finished", **v)
         if v.get("stop"):

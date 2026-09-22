@@ -28,6 +28,7 @@ FIELDS = {
     "business_schedulable",
     "scheduling_reason",
     "model",
+    "egress_ip", "egress_status", "attempt_no", "request_no", "ip_changes", "ip_changed",
 }
 
 
@@ -89,11 +90,15 @@ def snapshot():
         model = row.get("model") or "gpt-6-astra"
         detail = {key: row.get(key) for key in (
             "status", "expires_at", "issued_at", "length", "next_attempt", "auth_block")}
+        stats = row.get("egress") or {}
+        detail["egress"] = {key: stats[key] for key in
+            ("attempts", "requests", "ip_changes", "last_confirmed_ip", "egress_status") if key in stats}
         last = row.get("last_probe")
         if isinstance(last, dict):
             detail["last_probe"] = {key: last.get(key) for key in (
                 "at", "http", "actual_model", "length", "phase", "completed", "transport_error",
-                "error", "error_code", "captured", "renewed")}
+                "error", "error_code", "captured", "renewed", "egress_ip", "egress_status",
+                "attempt_no", "request_no", "ip_changes", "ip_changed")}
         account["models"][model] = detail
     for aid, gate in gates.items():
         account = accounts.setdefault(aid, {"account_id": aid, "account_name": "", "models": {}})
@@ -116,7 +121,7 @@ def snapshot():
         "models": models, "tickets": tickets, "events": events,
         "scheduling_enabled": scheduling.get("enabled", False) and automation.get("enabled", True),
         "automation": automation,
-        "policy": {"check_seconds": 20, "account_interval": 20, "renew_interval": 300,
+        "policy": {"check_seconds": 20, "account_interval": 20, "renew_interval": 30,
             "routes_per_cycle": 1, "concurrency": 3,
             "required_models": data.get("required_models") or ["gpt-6-astra"]},
     }

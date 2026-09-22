@@ -28,7 +28,7 @@ class MultiModelTests(unittest.TestCase):
         self.routes = [{"name": "private route", "key": "p", "url": "socks5://example.invalid:1000"}]
 
     def test_capture_and_verify_use_sol_and_queue_sol_candidate(self):
-        with patch.object(harvest, "request", return_value=({"completed": True, "actual_model": SOL}, self.value)) as request, patch.object(harvest, "emit"), patch.object(ticket_store, "queue_ticket") as queue:
+        with patch.object(harvest, "request", return_value=({"completed": True, "actual_model": SOL}, self.value, [])) as request, patch.object(harvest, "emit"), patch.object(ticket_store, "queue_ticket") as queue:
             result = harvest.collect(self.account, self.routes, {}, None, time.monotonic()+150, model=SOL)
         self.assertTrue(result['captured'])
         self.assertEqual(len(request.call_args_list), 2)
@@ -37,13 +37,13 @@ class MultiModelTests(unittest.TestCase):
         self.assertEqual(queue.call_args.args[1]['model'], SOL)
 
     def test_astra_response_to_sol_request_is_rejected(self):
-        with patch.object(harvest, "request", return_value=({"completed": True, "actual_model": ASTRA}, self.value)), patch.object(harvest, "emit"), patch.object(ticket_store, "queue_ticket") as queue:
+        with patch.object(harvest, "request", return_value=({"completed": True, "actual_model": ASTRA}, self.value, [])), patch.object(harvest, "emit"), patch.object(ticket_store, "queue_ticket") as queue:
             result = harvest.collect(self.account, self.routes, {}, None, time.monotonic()+150, model=SOL)
         self.assertFalse(result['captured'])
         queue.assert_not_called()
 
     def test_failed_sol_verification_is_not_queued(self):
-        with patch.object(harvest, "request", side_effect=[({"completed": True, "actual_model": SOL}, self.value), ({"completed": True, "actual_model": ASTRA}, '')]), patch.object(harvest, "emit"), patch.object(ticket_store, "queue_ticket") as queue:
+        with patch.object(harvest, "request", side_effect=[({"completed": True, "actual_model": SOL}, self.value, []), ({"completed": True, "actual_model": ASTRA}, '', [])]), patch.object(harvest, "emit"), patch.object(ticket_store, "queue_ticket") as queue:
             harvest.collect(self.account, self.routes, {}, None, time.monotonic()+150, model=SOL)
         queue.assert_not_called()
 
@@ -51,13 +51,13 @@ class MultiModelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, patch.object(settings, "PLUGIN_UID", os.getuid()), patch.object(settings, "PLUGIN_GID", os.getgid()):
             store = Path(temporary)/'tickets.json'
             for model in settings.MODELS:
-                ticket_store.queue_ticket(store, ticket_store.candidate(self.account, self.value, model))
+                ticket_store.queue_ticket(store, ticket_store.candidate(self.account, self.value, model=model))
             files = list((store.parent/'incoming').glob('*.json'))
             self.assertEqual(len(files), 2)
             self.assertEqual({json.loads(file.read_text())['model'] for file in files}, set(settings.MODELS))
 
     def test_missing_sol_does_not_block_astra_scheduling(self):
-        ticket = ticket_store.candidate(self.account, self.value, ASTRA)
+        ticket = ticket_store.candidate(self.account, self.value, model=ASTRA)
         with patch.object(settings, "REQUIRED_MODELS", (ASTRA,)):
             result = scheduling.decision(self.account, [ticket], True, {}, time.time())
         self.assertTrue(result['business_schedulable'])
@@ -65,21 +65,21 @@ class MultiModelTests(unittest.TestCase):
         self.assertEqual(result['missing_models'], [])
 
     def test_sol_cannot_substitute_for_astra_scheduling(self):
-        ticket = ticket_store.candidate(self.account, self.value, SOL)
+        ticket = ticket_store.candidate(self.account, self.value, model=SOL)
         with patch.object(settings, "REQUIRED_MODELS", (ASTRA,)):
             result = scheduling.decision(self.account, [ticket], True, {}, time.time())
         self.assertFalse(result['business_schedulable'])
 
     def test_model_retries_independent_but_auth_and_quota_are_shared(self):
         state = {}
-        with patch.object(harvest, "request", return_value=({"completed": True, "actual_model": "other"}, '')) as request, patch.object(harvest, "emit"):
+        with patch.object(harvest, "request", return_value=({"completed": True, "actual_model": "other"}, '', [])) as request, patch.object(harvest, "emit"):
             for model in settings.MODELS:
                 harvest.collect(self.account, self.routes, state, None, time.monotonic()+150, model=model)
         self.assertEqual(request.call_count, 2)
         for first, second in [(ASTRA, SOL), (SOL, ASTRA)]:
             for result in [{'stop': True, 'cooldown': 7200}, {'stop': True, 'auth_block': True}]:
                 state = {}
-                with patch.object(harvest, "request", return_value=(result, '')) as request, patch.object(harvest, "emit"):
+                with patch.object(harvest, "request", return_value=(result, '', [])) as request, patch.object(harvest, "emit"):
                     harvest.collect(self.account, self.routes, state, None, time.monotonic()+150, model=first)
                     harvest.collect(self.account, self.routes, state, None, time.monotonic()+150, model=second)
                 self.assertEqual(request.call_count, 1)
@@ -92,20 +92,20 @@ class MultiModelTests(unittest.TestCase):
 
     def test_request_payload_contains_target_model(self):
         def curl(args, cfg, should_run):
-            entries = dict(line.split(' = ', 1) for line in cfg.splitlines())
+            entries = dict(line.split(' = ', 1) for line in cfg.split('\nnext\n')[0].splitlines() if ' = ' in line)
             payload = json.loads(json.loads(entries['data']))
             self.assertEqual(payload['model'], SOL)
             Path(json.loads(entries['dump-header'])).write_text('HTTP/2 200\r\n')
             Path(json.loads(entries['output'])).write_text('data: '+json.dumps({'type':'response.completed','response':{'model':SOL}})+'\n')
             return subprocess.CompletedProcess(args, 0)
         with patch.object(harvest, 'run_curl', side_effect=curl):
-            result, _ = harvest.request(dict(self.account, token='synthetic', account='synthetic'), self.routes[0], model=SOL)
+            result, _, _ = harvest.request(dict(self.account, token='synthetic', account='synthetic'), self.routes[0], model=SOL)
         self.assertEqual(result['model'], SOL)
         self.assertEqual(result['actual_model'], SOL)
         self.assertTrue(result['completed'])
 
     def test_summary_matches_fresh_sol_after_same_cycle_import(self):
-        ticket = ticket_store.candidate(self.account, self.value, SOL)
+        ticket = ticket_store.candidate(self.account, self.value, model=SOL)
         state = {'attempts': {}, 'last_results': {'17:'+SOL: {'renewed': True}}}
         row = scheduling.cron.model_summary(self.account, SOL, [ticket], state, time.time())
         self.assertEqual(row['status'], 'fresh')

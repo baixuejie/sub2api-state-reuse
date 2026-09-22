@@ -14,8 +14,8 @@ import (
 
 func main() {
 	source, err := os.ReadFile("main.go")
-	if err != nil || !bytes.Contains(source, []byte(`const version = "1.0.14"`)) {
-		panic("runtime version must match package version 1.0.14")
+	if err != nil || !bytes.Contains(source, []byte(`const version = "1.0.15"`)) {
+		panic("runtime version must match package version 1.0.15")
 	}
 	key, e := os.ReadFile("publisher.key")
 	var priv ed25519.PrivateKey
@@ -44,7 +44,14 @@ func main() {
 	if e != nil {
 		panic(e)
 	}
-	files := map[string][]byte{"runtimes/linux-amd64/state-reuse": bin, "ui/index.html": []byte(`<!doctype html><meta charset="utf-8"><title>STATE Reuse</title><h1>STATE · Astra &amp; Sol</h1><p>独立采集与复验两种模型的 292 / 332 票据，按账号、模型、凭据隔离。调度由后台任务管理；详细状态见管理员的 STATE 采集日志页面。</p>`)}
+	files := map[string][]byte{"runtimes/linux-amd64/state-reuse": bin}
+	for _, name := range []string{"index.html", "app.js", "style.css"} {
+		data, err := os.ReadFile("ui/" + name)
+		if err != nil {
+			panic(err)
+		}
+		files["ui/"+name] = data
+	}
 	hashes := map[string]string{}
 	for k, v := range files {
 		h := sha256.Sum256(v)
@@ -52,7 +59,7 @@ func main() {
 	}
 	manifest := map[string]any{
 		"schema_version": 1, "id": "local.flownode.state-reuse",
-		"name": "STATE Reuse (Sub2API v1)", "version": "1.0.14+sub2api.v1.5",
+		"name": "STATE Reuse (Sub2API v1)", "version": "1.0.15+sub2api.v1.6",
 		"description": "STATE reuse adapted for the original Sub2API v1 host",
 		"requires": map[string]any{
 			"sub2api": ">=0.2.7 <0.3.0", "recommended_sub2api_version": "0.2.7",
@@ -69,7 +76,7 @@ func main() {
 	sig, _ := json.Marshal(map[string]string{"algorithm": "ed25519", "key_id": "local-flownode-state-reuse-20260919", "public_key": base64.StdEncoding.EncodeToString(pub), "signature": base64.StdEncoding.EncodeToString(ed25519.Sign(priv, m))})
 	files["manifest.json"] = m
 	files["signature.json"] = sig
-	f, e := os.Create("state-reuse-1.0.14+sub2api.v1.5.s2plugin")
+	f, e := os.Create("state-reuse-1.0.15+sub2api.v1.6.s2plugin")
 	if e != nil {
 		panic(e)
 	}

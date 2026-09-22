@@ -235,7 +235,7 @@
           <h1>模型票据与调度</h1>
           <p>Astra 与 Sol 独立采集、携票复验。每个账号的两种票据一眼可见。</p>
         </div>
-        <a href="/admin/accounts">返回账号管理 ↗</a>
+        <div class="controls"><a href="/admin/plugins">配置采集代理 ↗</a><a href="/admin/accounts">账号管理 ↗</a></div>
       </header>
       <div id="notice" role="status" aria-live="polite"></div>
       <section class="metrics" aria-label="采集概要">
@@ -317,7 +317,8 @@
                 <th>账号</th>
                 <th>探测模型</th>
                 <th>阶段</th>
-                <th>出口</th>
+                <th>实际出口 IP</th>
+                <th>尝试 / 换 IP 次数</th>
                 <th>结果</th>
                 <th>票据 / 实际模型</th>
               </tr>
@@ -327,6 +328,9 @@
         </div>
       </section>
       <p class="footer" id="updated">正在连接…</p>
+      <p class="footer">
+        在插件管理中点击 STATE 的「配置」修改采集代理，保存后下一轮生效。出口 IP 仅在同一连接确认时显示；无法确认及历史记录显示“未确认”。尝试次数按账号和模型累计，携票复验计入同次尝试；换 IP 次数仅统计已确认地址的变化，从本次功能启用后开始累计。
+      </p>
       <p class="footer">
         显示最近 500 条脱敏事件。只有完整返回目标模型、票据校验与携票复验均通过才入库。HTTP 200 本身不代表采集成功，票据也不是模型能力保证。
       </p>

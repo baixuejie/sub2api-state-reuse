@@ -27,7 +27,7 @@ import (
 )
 
 const pluginID = "local.flownode.state-reuse"
-const version = "1.0.14"
+const version = "1.0.15"
 const stateHeader = "X-Codex-Turn-State"
 const dataDir = "/app/data/fn-state-reuse"
 const businessConcurrencyPerAccount = 2
@@ -36,6 +36,7 @@ const businessConcurrencyPerAccount = 2
 // captured alongside it) for roughly ticketTTLSeconds; requests carrying an
 // older bundle are routed as if no ticket was sent.
 const ticketTTLSeconds = 240
+
 // Stop reusing a bundle slightly before upstream expiry so a request never
 // starts on a ticket that dies mid-flight. Mirrors the collector's scheduling
 // margin.
@@ -109,7 +110,7 @@ func parseConfig(raw []byte) (Config, error) {
 	}
 	if c.HarvestProxyAPI != "" {
 		h, e := url.Parse(c.HarvestProxyAPI)
-		if e != nil || h.Scheme != "http" || h.Host == "" || h.User != nil || h.Path != "/gen" || h.Fragment != "" {
+		if e != nil || (h.Scheme != "http" && h.Scheme != "https") || h.Hostname() == "" || h.User != nil || h.Fragment != "" {
 			return c, errors.New("invalid harvest proxy generator")
 		}
 	}

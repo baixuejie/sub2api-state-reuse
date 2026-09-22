@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STATE 采集代理</title>
+<link rel="stylesheet" href="style.css">
+<main>
+  <p class="eyebrow">STATE · ASTRA / SOL</p>
+  <h1>采集代理</h1>
+  <p class="hint">保存后下一轮采集使用新配置。业务请求继续使用账号绑定的代理。</p>
+  <label for="proxy">HTTP / SOCKS5 代理地址</label>
+  <input id="proxy" type="password" autocomplete="off" spellcheck="false" placeholder="socks5h://用户名:密码@主机:端口">
+  <p class="hint">支持 http、https、socks5、socks5h；固定代理和自动轮换的统一入口都填写在这里。</p>
+  <label for="generator">动态 IP 提取接口（可选）</label>
+  <input id="generator" type="password" autocomplete="off" spellcheck="false" placeholder="https://服务商/提取接口?参数">
+  <p class="hint">接口需返回一行 IP:端口。填写后每次采集先获取一个 HTTP 出口，携票复验沿用该出口；留空则直接使用上面的代理地址。</p>
+  <label class="check"><input id="reveal" type="checkbox">显示地址</label>
+  <div class="buttons">
+    <button id="save" type="button" disabled>保存代理配置</button>
+    <button id="reload" type="button" disabled>重新读取</button>
+  </div>
+  <p id="status" role="status" aria-live="polite">正在读取配置…</p>
+  <p class="hint">在「STATE 采集日志」查看实际出口 IP、累计尝试及换 IP 次数。原有采集账号和暂停名单会保留。</p>
+</main>
+<script src="app.js"></script>
+</html>

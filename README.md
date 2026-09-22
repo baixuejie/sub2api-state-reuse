@@ -2,7 +2,7 @@
 
 本分支基于 [little-greenbean/sub2api-state-reuse](https://github.com/little-greenbean/sub2api-state-reuse)，将 STATE 插件适配到原作者 [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api) 的 v1 插件宿主，并提供可独立部署的自动化脚本与管理员监控页。
 
-当前插件版本：`1.0.14+sub2api.v1.5`，已在 Sub2API `0.2.7` 上验证。原项目面向另一分支的 v2 宿主；两种插件协议不能混装。本仓库保留上游 SDK、来源声明和 LGPL-3.0 许可证。
+当前插件版本：`1.0.15+sub2api.v1.6`，已在 Sub2API `0.2.7` 上验证。原项目面向另一分支的 v2 宿主；两种插件协议不能混装。本仓库保留上游 SDK、来源声明和 LGPL-3.0 许可证。
 
 **插件和全部自动化脚本位于 [`local/sub2api-v1`](https://github.com/baixuejie/sub2api-state-reuse/tree/local/sub2api-v1) 分支。** `main` 保留原作者代码；请先切换分支再下载或开发：
 
@@ -25,6 +25,14 @@ cd sub2api-state-reuse
 - **429 防护**：范围内账号业务并发上限为 2，覆盖整个流式响应；429 保留票据并至少退避 5 分钟（尊重更长的 `Retry-After`），401/403 仅撤销请求实际使用的当前票据，旧响应不能误删新票。退避保存在单个插件进程内，重启不持久化。
 - **动态轮换代理**：可选配置 HTTP 代理生成器，缺票时与 Clash、IP 管理出口交替尝试；每次选中动态出口都重新调用生成器获取新 IP。
 - **管理员日志页**：一行一个账号，Astra / Sol 双列状态、有效期、最近结果、账号搜索和模型筛选，每 3 秒刷新。数据接口每次向宿主校验管理员身份。
+
+## 页面配置代理与查看轮换
+
+主站「插件管理 → STATE Reuse → 配置」可直接修改 HTTP(S) / SOCKS5(h) 代理地址，以及可选的动态 IP 提取接口。配置通过宿主 UI Bridge 写入原有加密插件配置，下一轮采集读取；账号和暂停名单保留。动态接口支持 HTTP(S) 路径及查询参数，需返回一行 `IP:端口`，每次采集重新取出口，携票复验使用同一次提取结果。
+
+`/admin/state-harvest` 增加实际出口 IP、累计尝试次数与已确认换 IP 次数，按账号和模型独立持久保存。从部署本功能后开始累计，旧记录不回填。每次采集及携票复验完成后，在同一 curl 进程内使用 HTTP/1.1 访问 `https://chatgpt.com/cdn-cgi/trace`；只有后一个请求没有新建连接且返回合法公网 IP，才将该 IP 归属于前面的打票请求。探测请求不附带账号 token 或票据 Cookie。连接变化、trace 不可用或打票传输失败时显示“未确认”，不将代理入口地址当成出口。
+
+一次 capture 算一次尝试，verify 属于同次尝试但另记请求次数。换 IP 次数统计相邻已确认地址的变化，无法确认的请求不增加轮换数；这是确认到的变化次数，不代表代理商实际完成的全部轮换。计数保存在现有 `cron-state.json`，重启服务不清零。日志指外部定时采集器的打票/复验事件，不是主站业务请求日志或插件请求内采集。
 
 ## 目录
 
@@ -49,7 +57,7 @@ cd sub2api-state-reuse
 make check test build
 ```
 
-生成 `plugin/state-reuse-1.0.14+sub2api.v1.5.s2plugin`。首次打包会生成本地 `publisher.key` 与 `publisher.pub`；两者均不提交到仓库。升级时保留并复用私钥，避免发布身份变化。
+生成 `plugin/state-reuse-1.0.15+sub2api.v1.6.s2plugin`。首次打包会生成本地 `publisher.key` 与 `publisher.pub`；两者均不提交到仓库。升级时保留并复用私钥，避免发布身份变化。
 
 在宿主配置中，将生成的公钥加入 `plugins.trusted_publishers`，键名对应安装包签名中的 `key_id`。当前打包器使用 `local-flownode-state-reuse-20260919`；生产环境继续保持 `plugins.allow_unsigned=false`。重启宿主加载公钥后，通过管理员插件页面上传安装包。
 

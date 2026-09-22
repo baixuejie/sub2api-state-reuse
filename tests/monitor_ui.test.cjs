@@ -81,3 +81,18 @@ test("unavailable management API is distinguished from disabled plugin", async (
     assert.match(dom.window.document.querySelector('[data-account-id="17"]').textContent, /自动化已暂停/);
   } finally { dom.window.close(); }
 });
+
+test("egress addresses and cumulative attempts are distinct from confirmed rotations", async () => {
+  const data = fixture();
+  Object.assign(data.events[0], {egress_ip:"8.8.8.8",egress_status:"confirmed",attempt_no:7,ip_changes:2,ip_changed:true});
+  Object.assign(data.events[1], {egress_status:"connection_changed",attempt_no:8,ip_changes:2});
+  data.accounts[0].models[ASTRA].egress = {attempts:7,ip_changes:2,last_confirmed_ip:"8.8.8.8"};
+  const dom = await mount(data);
+  try {
+    const events = dom.window.document.getElementById("events").textContent;
+    assert.match(events, /8\.8\.8\.8/); assert.match(events, /第 7 次尝试/);
+    assert.match(events, /已确认换 IP 2 次/); assert.match(events, /连接已变化/);
+    assert.match(dom.window.document.getElementById("accounts").textContent, /累计尝试 7 次/);
+    assert.equal(dom.window.document.querySelector('a[href="/admin/plugins"]').textContent, "配置采集代理 ↗");
+  } finally { dom.window.close(); }
+});

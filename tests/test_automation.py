@@ -99,7 +99,7 @@ class AutomationTests(unittest.TestCase):
 
     def test_disable_after_verification_prevents_candidate_write(self):
         checks = iter([True, True, True, False])
-        with patch.object(local_ip_harvest, "request", return_value=({"completed": True, "actual_model": local_ip_harvest.MODEL}, 'ticket')), patch.object(local_ip_harvest.mh, "candidate", return_value={"value": "ticket"}), patch.object(local_ip_harvest.mh, "queue_ticket") as queue, patch.object(local_ip_harvest, "emit"):
+        with patch.object(local_ip_harvest, "request", return_value=({"completed": True, "actual_model": local_ip_harvest.MODEL}, 'ticket', [])), patch.object(local_ip_harvest.mh, "candidate", return_value={"value": "ticket"}), patch.object(local_ip_harvest.mh, "queue_ticket") as queue, patch.object(local_ip_harvest, "emit"):
             result = local_ip_harvest.collect({"id": 1, "hash": 'a'*64}, [{"key": 'p', "name": 'proxy'}], {}, None, time.monotonic()+150, should_run=lambda: next(checks))
         self.assertTrue(result['automation_stopped'])
         queue.assert_not_called()

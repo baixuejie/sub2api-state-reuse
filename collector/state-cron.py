@@ -5,6 +5,7 @@ import local_ip_harvest
 import sys
 import base64, concurrent.futures, datetime, fcntl, hashlib, json, os, pathlib, subprocess, time, urllib.request, urllib.error
 import settings
+import egress
 import fnmatch
 from automation import AutomationStopped, PluginSwitch
 
@@ -195,10 +196,14 @@ def model_summary(account, model, tickets, state, now):
         "length": len(newest["value"]) if newest else None,
         "next_attempt": max(state["attempts"].get(f"{account['id']}:{model}", 0)
             + local_ip_harvest.retry_interval(status), model_state.get("next_attempt", 0), shared.get("next_attempt", 0)),
-        "auth_block": auth_block, "last_probe": last}
+        "auth_block": auth_block, "last_probe": last,
+        "egress": state.get("local_ip_harvest", {}).get("_egress", {}).get(f"{account['id']}:{model}", {})}
 
 
 def collection_routes(cfg):
+    if cfg.get("harvest_proxy_api"):
+        return [{"key": "plugin-generator", "name": "动态 IP 提取接口",
+                 "generator_url": cfg["harvest_proxy_api"]}]
     if settings.PROXY_SOURCE != "plugin":
         return local_ip_harvest.routes_for(sys.modules[__name__])
     from urllib.parse import urlsplit, urlunsplit
@@ -396,7 +401,8 @@ def run_locked():
                 "length": probe.get("length"), "phase": probe.get("phase"),
                 "completed": bool(probe.get("completed")), "transport_error": probe.get("transport_error"),
                 "error": probe.get("error"), "error_code": probe.get("error_code"),
-                "captured": bool(result.get("captured")), "renewed": bool(result.get("renewed"))}
+                "captured": bool(result.get("captured")), "renewed": bool(result.get("renewed")),
+                **{key: probe[key] for key in egress.FIELDS if key in probe}}
     atomic(STATE, state)
     final = get_tickets()
     switch.require()

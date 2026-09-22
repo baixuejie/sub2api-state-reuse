@@ -12,7 +12,9 @@ check:
 	python3 -m compileall -q collector monitor tests
 	node --check monitor/app.js
 	node --check monitor/entry.js
+	node --check plugin/ui/app.js
 
 # Provide jsdom through NODE_PATH when running this standalone monitor suite.
 test-ui:
 	node tests/monitor_ui.test.cjs
+	node tests/plugin_ui.test.cjs
